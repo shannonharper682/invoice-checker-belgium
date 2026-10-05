@@ -10,7 +10,7 @@
 # MAGIC Combined invoice checker merging three Belgium Fluxys invoice checks into a single notebook.
 # MAGIC
 # MAGIC **Checks performed:**
-# MAGIC 1. **Long Term Capacity (LTC)** — Entry/Exit at IC Point (Firm) capacity bookings vs Endur deals
+# MAGIC 1. **Long Term Capacity (LTC)** — Entry/Exit at IC Point (Firm + Interruptible) capacity bookings vs Endur deals
 # MAGIC 2. **Allocation Settlement** — Purchases (bill) and Sales (self-bill) at end-user domestic points vs dispatch deltas
 # MAGIC 3. **Variable Trading Fee** — ZTP Trading variable fee vs ZTPH shipper volumes
 # MAGIC
@@ -20,7 +20,7 @@
 # MAGIC
 # MAGIC | Table | Contents |
 # MAGIC |---|---|
-# MAGIC | `be_longterm_results` | LTC comparison — Entry/Exit at IC Point (Firm) |
+# MAGIC | `be_longterm_results` | LTC comparison — Entry/Exit at IC Point (Firm + Interruptible) |
 # MAGIC | `be_longterm_flagged` | LTC flagged issues (capacity mismatches, back-billing) |
 # MAGIC | `be_allocsettle_daily` | Allocation settlement daily comparison grid |
 # MAGIC | `be_allocsettle_summary` | Allocation settlement monthly summary |
@@ -120,16 +120,18 @@
 
 # DBTITLE 1,Parse Invoice XML
 # =============================================================================
-# PARSER 1: LTC — Extract IC Point capacity lines (Firm)
+# PARSER 1: LTC — Extract IC Point capacity lines (Firm + Interruptible)
 # =============================================================================
 def parse_invoice(path):
     tree = ET.parse(path)
     rows = []
-    VALID = ('Entry at Interconnection Point (Firm)', 'Exit at Interconnection Point (Firm)')
+    VALID = ('Entry at Interconnection Point (Firm)', 'Exit at Interconnection Point (Firm)',
+             'Entry at Interconnection Point (Interruptible)', 'Exit at Interconnection Point (Interruptible)')
     for prod in tree.getroot().iter('CustomerProduct'):
         pname = (prod.findtext('ProductName') or '').strip()
         if not (pname.startswith(VALID) or 'Auction' in pname or 'Premium' in pname):
             continue
+        _cap_type = 'Interruptible' if 'Interruptible' in pname else 'Firm'
         for il in prod.findall('./InvoiceLines/InvoiceLine'):
             for bq in il.findall('.//BilledQuantity'):
                 ai, pfi = bq.find('AdditionalInformation'), bq.find('PriceFormulaInformation')
@@ -142,6 +144,7 @@ def parse_invoice(path):
                 if service_hours <= 0: service_hours += 24
                 qty_val = float(qty_el.get('QTY', 0)) if qty_el is not None else None
                 rows.append({
+                    'capacity_type': _cap_type,
                     'invoice_line_group': (il.findtext('InvoiceLineGroup') or '').strip(),
                     'location': (il.findtext('InvoiceLine') or '').strip(),
                     'detail': (il.findtext('InvoiceLineDetail') or '').strip(),
@@ -259,14 +262,15 @@ all_month_start = billing_months[0]
 
 IC = ['Entry at Interconnection Point - Firm', 'Exit at Interconnection Point - Firm',
       'Auction Premium on Exit at Interconnection Point - Firm',
-      'Auction Premium on Entry at Interconnection Point - Firm']
+      'Auction Premium on Entry at Interconnection Point - Firm',
+      'Entry at Interconnection Point - Interruptible', 'Exit at Interconnection Point - Interruptible']
 df_lt = df_all_ltc[df_all_ltc['invoice_line_group'].isin(IC)].copy()
 df_lt['billing_month'] = df_lt['billing_start'].apply(lambda d: d.replace(day=1) if d else None)
 
 is_auc = df_lt['detail'].str.contains('Auction|Premium', case=False, na=False)
 def _contracts(x): return ', '.join(sorted(set(str(v) for v in x if v)))
 
-summary = df_lt[~is_auc].groupby(['billing_month', 'direction', 'location', 'detail', 'service_rate_type'], as_index=False).agg(
+summary = df_lt[~is_auc].groupby(['billing_month', 'direction', 'location', 'detail', 'service_rate_type', 'capacity_type'], as_index=False).agg(
     tariff_eur=('billed_amount', 'sum'), total_qty_kwh_h=('qty', 'sum'),
     total_volume_kwh=('volume_kwh', 'sum'), num_days=('gas_day', 'nunique'),
     up=('up', 'first'), up_unit=('up_unit', 'first'),
@@ -279,13 +283,17 @@ auc_summary = (df_lt[is_auc].groupby(['billing_month', 'direction', 'location'],
 
 print(f"\n--- LONG TERM CAPACITY ---")
 print(f"Invoice month (M): {invoice_month}  |  Previous (M-1): {billing_months[0] if len(billing_months) > 1 else 'N/A'}")
-print(f"IC capacity lines: {(~is_auc).sum()} tariff + {is_auc.sum()} auction")
+firm_count = len(df_lt[df_lt['capacity_type'] == 'Firm'])
+int_count = len(df_lt[df_lt['capacity_type'] == 'Interruptible'])
+print(f"IC capacity lines: {(~is_auc).sum()} tariff + {is_auc.sum()} auction  (Firm: {firm_count}, Interruptible: {int_count})")
 for bm in billing_months:
     bm_rows = summary[summary['billing_month'] == bm]
     label = 'M' if bm == invoice_month else 'M-1'
-    lt_count = len(bm_rows[bm_rows['service_rate_type'] == 'LongTerm'])
-    seas_count = len(bm_rows[bm_rows['service_rate_type'] == 'Season'])
-    print(f"  {bm} ({label}): {lt_count} long-term + {seas_count} seasonal groups")
+    for ct in sorted(bm_rows['capacity_type'].unique()):
+        ct_rows = bm_rows[bm_rows['capacity_type'] == ct]
+        lt_count = len(ct_rows[ct_rows['service_rate_type'] == 'LongTerm'])
+        seas_count = len(ct_rows[ct_rows['service_rate_type'] == 'Season'])
+        print(f"  {bm} ({label}) [{ct}]: {lt_count} long-term + {seas_count} seasonal groups")
 
 # --- 2. Variable Fee & Energy in Cash parsing ---
 # Both are billed ~3 months in arrears — detect period from actual gas_days
@@ -376,9 +384,9 @@ print(f"{'='*80}")
 
 # --- LTC Summary ---
 print(f"\n\u2501\u2501 LONG TERM CAPACITY ({invoice_month.strftime('%B %Y')}) \u2501\u2501")
-ltc_summary_display = summary[['billing_month', 'direction', 'location', 'service_rate_type',
+ltc_summary_display = summary[['billing_month', 'capacity_type', 'direction', 'location', 'service_rate_type',
     'capacity_kwh_h', 'tariff_eur', 'num_days', 'up', 'up_unit']].copy()
-ltc_summary_display.columns = ['Billing Month', 'Direction', 'Location', 'Rate Type',
+ltc_summary_display.columns = ['Billing Month', 'Capacity Type', 'Direction', 'Location', 'Rate Type',
     'Capacity kWh/h', 'Tariff EUR', 'Days', 'Unit Price', 'Unit']
 if len(auc_summary) > 0:
     auc_display = auc_summary[['billing_month', 'direction', 'location', 'auction_eur']].copy()
@@ -495,11 +503,11 @@ df_endur = spark.sql(f"""
         FROM ms_atlas.endur_standard.deal_v2latest d2
         JOIN ms_atlas.endur_standard.profilevolume_v2latest pv2 ON d2.deal_number = pv2.deal_number
         WHERE d2.instrument_type_name IN ('COMM-CAP-EXIT','COMM-CAP-ENTRY')
-          AND d2.buy_sell_name='Sell' AND d2.service_type='Firm' AND d2.tran_status='Validated'
+          AND d2.buy_sell_name='Sell' AND d2.service_type IN ('Firm','Interruptible') AND d2.tran_status='Validated'
           AND pv2.settlement_type_id=1 AND pv2.price>0 AND LOWER(d2.reference) NOT LIKE '%conversion%'
     ),
     raw AS (
-        SELECT d.deal_number, d.reference,
+        SELECT d.deal_number, d.reference, d.service_type AS endur_capacity_type,
             CASE WHEN d.instrument_type_name='COMM-CAP-ENTRY' THEN 'Entry' ELSE 'Exit' END AS direction,
             CASE WHEN d.reference LIKE 'PRI-%' THEN SPLIT(d.reference,'-')[2] ELSE NULL END AS allocation_id,
             l.location_name,
@@ -521,7 +529,7 @@ df_endur = spark.sql(f"""
         JOIN ms_atlas.endur_standard.location_v2latest l ON pv.location_id=l.location_id
         JOIN ms_vulcan_gpgtopm_plab.hub2hub_v1.location_country_mapping cm ON pv.location_id=cm.location_id
         WHERE d.instrument_type_name IN ('COMM-CAP-EXIT','COMM-CAP-ENTRY')
-          AND d.service_type='Firm' AND d.tran_status='Validated' AND pv.settlement_type_id=1
+          AND d.service_type IN ('Firm','Interruptible') AND d.tran_status='Validated' AND pv.settlement_type_id=1
           AND (pv.price!=0 OR (d.reference LIKE 'PRI_SEC_%' AND d.buy_sell_name='Sell'
                AND pv.location_id IN (SELECT location_id FROM net_billed)))
           AND cm.country_code='BE'
@@ -547,14 +555,19 @@ for bm in billing_months:
     lt_ct = df_longterm.filter(F.col('billing_month') == str(bm)).count()
     seas_ct = df_seasonal.filter(F.col('billing_month') == str(bm)).count()
     label = 'M' if bm == invoice_month else 'M-1'
-    print(f"  {bm} ({label}): {lt_ct} long-term + {seas_ct} seasonal deals")
+    # Show Firm vs Interruptible breakdown
+    lt_firm = df_longterm.filter((F.col('billing_month') == str(bm)) & (F.col('endur_capacity_type') == 'Firm')).count()
+    lt_int = df_longterm.filter((F.col('billing_month') == str(bm)) & (F.col('endur_capacity_type') == 'Interruptible')).count()
+    seas_firm = df_seasonal.filter((F.col('billing_month') == str(bm)) & (F.col('endur_capacity_type') == 'Firm')).count()
+    seas_int = df_seasonal.filter((F.col('billing_month') == str(bm)) & (F.col('endur_capacity_type') == 'Interruptible')).count()
+    print(f"  {bm} ({label}): {lt_ct} long-term (F:{lt_firm} I:{lt_int}) + {seas_ct} seasonal (F:{seas_firm} I:{seas_int})")
 
 print(f"\n--- Long-term deals ---")
-display(df_longterm.select('deal_number','reference','direction','location_name','billing_month','booking_type','vol','price','capacity_kwh_h','endur_eur')
+display(df_longterm.select('deal_number','reference','direction','location_name','billing_month','booking_type','endur_capacity_type','vol','price','capacity_kwh_h','endur_eur')
     .orderBy('billing_month','direction','location_name'))
 if seas_count > 0:
     print(f"\n--- Seasonal deals (sample) ---")
-    display(df_seasonal.select('deal_number','reference','direction','location_name','pv_start','booking_type','vol','price','capacity_kwh_h','endur_eur')
+    display(df_seasonal.select('deal_number','reference','direction','location_name','pv_start','booking_type','endur_capacity_type','vol','price','capacity_kwh_h','endur_eur')
         .orderBy('pv_start','direction','location_name').limit(20))
 
 # COMMAND ----------
@@ -565,7 +578,7 @@ if seas_count > 0:
 # =============================================================================
 compare_base = (
     df_lt[~is_auc]
-    .groupby(['billing_month', 'direction', 'location', 'service_rate_type'], as_index=False)
+    .groupby(['billing_month', 'direction', 'location', 'service_rate_type', 'capacity_type'], as_index=False)
     .agg(
         tariff_eur=('billed_amount', 'sum'),
         total_qty_kwh_h=('qty', 'sum'),
@@ -590,9 +603,13 @@ annualized_price_col = F.when(
 for _, r in compare_base.iterrows():
     bm, d, loc = r['billing_month'], r['direction'], r['location']
     rate_type = r['service_rate_type']
+    cap_type = r['capacity_type']
     cfg = ROUTE_MAP.get((d, loc))
     endur_locs = cfg['endur'] if cfg else None
     endur_df = df_longterm if rate_type == 'LongTerm' else df_seasonal
+    # Filter Endur to matching capacity type (Firm/Interruptible)
+    if endur_df is not None:
+        endur_df = endur_df.filter(F.col('endur_capacity_type') == cap_type)
     days_in_month = calendar.monthrange(bm.year, bm.month)[1]
 
     e_cap = e_eur = endur_price = None
@@ -649,7 +666,7 @@ for _, r in compare_base.iterrows():
         price_gap_pct = 0.0 if invoice_price is not None else None
     rows.append({
         'billing_month': str(bm), 'direction': d, 'location': loc, 'line_type': 'Tariff',
-        'service_rate_type': rate_type, 'detail': r['detail'],
+        'capacity_type': cap_type, 'service_rate_type': rate_type, 'detail': r['detail'],
         'invoice_kwh_h': round(r['invoice_kwh_h'], 2),
         'endur_kwh_h': round(e_cap, 2) if e_cap is not None else None,
         'invoice_eur': round(r['tariff_eur'], 2),
@@ -668,7 +685,7 @@ for _, r in compare_base.iterrows():
         auc_endur = (e_eur - base_tariff_eur) if (e_eur is not None and base_tariff_eur is not None) else None
         rows.append({
             'billing_month': str(bm), 'direction': d, 'location': loc, 'line_type': 'Auction Premium',
-            'service_rate_type': rate_type, 'detail': 'Auction Premium',
+            'capacity_type': cap_type, 'service_rate_type': rate_type, 'detail': 'Auction Premium',
             'invoice_kwh_h': None, 'endur_kwh_h': None,
             'invoice_eur': round(auc_eur, 2),
             'equinor_eur': round(auc_endur, 2) if auc_endur is not None else None,
@@ -695,19 +712,22 @@ for _, r in df_comparison.iterrows():
     gas_day = bm
     if lt == 'Tariff':
         if r['endur_kwh_h'] is None or pd.isna(r['endur_kwh_h']):
-            flags.append({'type': rate_type, 'gas_day': gas_day, 'direction': d, 'location': loc,
+            flags.append({'type': rate_type, 'capacity_type': r.get('capacity_type', 'Firm'),
+                'gas_day': gas_day, 'direction': d, 'location': loc,
                 'invoice_value': r['invoice_kwh_h'], 'endur_value': None,
-                'gap': None, 'gap_pct': None, 'unit': 'kWh/h', 'note': 'NO ENDUR MATCH'})
+                'gap': None, 'gap_pct': None, 'unit': 'kWh/h', 'note': f'NO ENDUR MATCH [{r.get("capacity_type", "Firm")}]'})
         else:
             if r['endur_kwh_h'] != r['invoice_kwh_h']:
                 gap = r['endur_kwh_h'] - r['invoice_kwh_h']
                 gap_pct = round(gap / r['invoice_kwh_h'] * 100, 3) if r['invoice_kwh_h'] else None
                 if gap_pct is not None and abs(gap_pct) > 1:
-                    flags.append({'type': rate_type, 'gas_day': gas_day, 'direction': d, 'location': loc,
+                    flags.append({'type': rate_type, 'capacity_type': r.get('capacity_type', 'Firm'),
+                        'gas_day': gas_day, 'direction': d, 'location': loc,
                         'invoice_value': r['invoice_kwh_h'], 'endur_value': r['endur_kwh_h'],
                         'gap': gap, 'gap_pct': gap_pct, 'unit': 'kWh/h', 'note': 'capacity rate mismatch'})
             if r.get('price_gap_pct') is not None and abs(r['price_gap_pct']) > 1:
-                flags.append({'type': rate_type, 'gas_day': gas_day, 'direction': d, 'location': loc,
+                flags.append({'type': rate_type, 'capacity_type': r.get('capacity_type', 'Firm'),
+                    'gas_day': gas_day, 'direction': d, 'location': loc,
                     'invoice_value': r.get('invoice_price'), 'endur_value': r.get('endur_price'),
                     'gap': r.get('price_gap'), 'gap_pct': r.get('price_gap_pct'),
                     'unit': r.get('price_unit'), 'note': 'price mismatch'})
@@ -715,32 +735,36 @@ for _, r in df_comparison.iterrows():
         if r['gap_eur'] is not None and r['invoice_eur']:
             gap_pct = round(r['gap_eur'] / r['invoice_eur'] * 100, 3)
             if abs(gap_pct) > 1:
-                flags.append({'type': 'AuctionPremium', 'gas_day': gas_day, 'direction': d, 'location': loc,
+                flags.append({'type': 'AuctionPremium', 'capacity_type': r.get('capacity_type', 'Firm'),
+                    'gas_day': gas_day, 'direction': d, 'location': loc,
                     'invoice_value': r['invoice_eur'], 'endur_value': r['equinor_eur'],
                     'gap': r['gap_eur'], 'gap_pct': gap_pct, 'unit': 'EUR', 'note': 'auction premium EUR mismatch'})
 
 # Endur-only routes
 for bm in billing_months:
-    inv_routes = set((r['direction'], r['location']) for _, r in compare_base[compare_base['billing_month'] == bm].iterrows())
+    inv_routes = set((r['direction'], r['location'], r['capacity_type']) for _, r in compare_base[compare_base['billing_month'] == bm].iterrows())
     for (d, loc), cfg in ROUTE_MAP.items():
         if bm != invoice_month and cfg['type'] == 'longterm': continue
-        if (d, loc) in inv_routes: continue
-        endur_locs = cfg['endur']
-        endur_df = df_longterm if cfg['type'] == 'longterm' else df_seasonal
-        agg = endur_df.filter((F.col('location_name').isin(endur_locs)) & (F.col('billing_month') == str(bm))).agg(
+        for _ect in ['Firm', 'Interruptible']:
+            if (d, loc, _ect) in inv_routes: continue
+            endur_locs = cfg['endur']
+            endur_df = df_longterm if cfg['type'] == 'longterm' else df_seasonal
+            endur_df = endur_df.filter(F.col('endur_capacity_type') == _ect)
+            agg = endur_df.filter((F.col('location_name').isin(endur_locs)) & (F.col('billing_month') == str(bm))).agg(
             F.abs(F.sum(F.col('capacity_kwh_h'))).alias('cap_net'),
             F.sum(F.abs(F.col('capacity_kwh_h'))).alias('cap_sum'),
             F.countDistinct(F.col('pv_start').cast('date')).alias('distinct_days')
         ).collect()[0]
-        endur_cap = None
-        if agg['cap_net'] or agg['cap_sum']:
-            endur_cap = float(agg['cap_net']) if cfg['type'] == 'longterm' else (
-                float(agg['cap_sum']) / float(agg['distinct_days']) if agg['distinct_days'] else None)
-        if endur_cap and endur_cap > 0:
-            flags.append({'type': 'LongTerm' if cfg['type'] == 'longterm' else 'Season',
-                'gas_day': str(bm), 'direction': d, 'location': loc,
-                'invoice_value': None, 'endur_value': endur_cap,
-                'gap': None, 'gap_pct': None, 'unit': 'kWh/h', 'note': 'ENDUR ONLY (not invoiced)'})
+            endur_cap = None
+            if agg['cap_net'] or agg['cap_sum']:
+                endur_cap = float(agg['cap_net']) if cfg['type'] == 'longterm' else (
+                    float(agg['cap_sum']) / float(agg['distinct_days']) if agg['distinct_days'] else None)
+            if endur_cap and endur_cap > 0:
+                flags.append({'type': 'LongTerm' if cfg['type'] == 'longterm' else 'Season',
+                    'capacity_type': _ect,
+                    'gas_day': str(bm), 'direction': d, 'location': loc,
+                    'invoice_value': None, 'endur_value': endur_cap,
+                    'gap': None, 'gap_pct': None, 'unit': 'kWh/h', 'note': f'ENDUR ONLY [{_ect}] (not invoiced)'})
 
 ltc_flags = pd.DataFrame(flags)
 if len(ltc_flags) > 0:
@@ -2212,3 +2236,311 @@ else:
 print(f"\n{'='*80}")
 print(f"All results saved to {NEW_SCHEMA}")
 print(f"{'='*80}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Explore Interruptible Capacity — Invoice
+# =============================================================================
+# EXPLORE INTERRUPTIBLE CAPACITY — INVOICE (April 2026)
+# =============================================================================
+import xml.etree.ElementTree as ET
+import pandas as pd
+
+tree = ET.parse(INVOICE_PATH)
+root = tree.getroot()
+
+# 1. List ALL product names in this invoice
+print("ALL PRODUCT NAMES IN INVOICE:")
+print("=" * 80)
+all_products = []
+for prod in root.iter('CustomerProduct'):
+    pname = (prod.findtext('ProductName') or '').strip()
+    all_products.append(pname)
+    marker = " <-- INTERRUPTIBLE" if 'Interruptible' in pname else ""
+    print(f"  {pname}{marker}")
+
+# 2. Parse interruptible capacity lines specifically
+print(f"\n{'='*80}")
+print("INTERRUPTIBLE CAPACITY LINES:")
+print("=" * 80)
+
+interruptible_rows = []
+for prod in root.iter('CustomerProduct'):
+    pname = (prod.findtext('ProductName') or '').strip()
+    if 'Interruptible' not in pname:
+        continue
+    for il in prod.findall('./InvoiceLines/InvoiceLine'):
+        for bq in il.findall('.//BilledQuantity'):
+            ai = bq.find('AdditionalInformation')
+            pfi = bq.find('PriceFormulaInformation')
+            qty_el = pfi.find('QTY') if pfi is not None else None
+            up_el = pfi.find('UP') if pfi is not None else None
+            econ_start = bq.findtext('EconomicStartDate')
+            sh_start = int(ai.findtext('ServiceStartGasHour') or 0) if ai is not None else 0
+            sh_end = int(ai.findtext('ServiceEndGasHour') or 0) if ai is not None else 0
+            service_hours = (sh_end - sh_start + 1) if (sh_start > 0 and sh_end > 0) else 24
+            if service_hours <= 0: service_hours += 24
+            qty_val = float(qty_el.get('QTY', 0)) if qty_el is not None else None
+            interruptible_rows.append({
+                'product_name': pname,
+                'invoice_line_group': (il.findtext('InvoiceLineGroup') or '').strip(),
+                'location': (il.findtext('InvoiceLine') or '').strip(),
+                'detail': (il.findtext('InvoiceLineDetail') or '').strip(),
+                'billing_start': pd.to_datetime(il.findtext('BillingStartDate')).date() if il.findtext('BillingStartDate') else None,
+                'gas_day': pd.to_datetime(econ_start).date() if econ_start else None,
+                'direction': ai.findtext('Direction') if ai is not None else None,
+                'service_rate_type': ai.findtext('ServiceRateType') if ai is not None else None,
+                'contract_ref': ai.findtext('ContractReference') if ai is not None else None,
+                'billed_amount': float(bq.findtext('BilledQuantityAmount') or 0),
+                'qty_kwh_h': qty_val,
+                'service_hours': service_hours,
+                'volume_kwh': qty_val * service_hours if qty_val else 0,
+                'up': float(up_el.get('UP', 0)) if up_el is not None else None,
+                'up_unit': up_el.get('UPUnit', '') if up_el is not None else None,
+            })
+
+df_interruptible = pd.DataFrame(interruptible_rows)
+
+if len(df_interruptible) > 0:
+    print(f"\nFound {len(df_interruptible)} interruptible line(s)\n")
+    
+    # Summary by product, direction, location
+    int_summary = df_interruptible.groupby(
+        ['product_name', 'invoice_line_group', 'direction', 'location', 'service_rate_type'], as_index=False
+    ).agg(
+        total_billed_eur=('billed_amount', 'sum'),
+        total_qty_kwh_h=('qty_kwh_h', 'sum'),
+        num_days=('gas_day', 'nunique'),
+        avg_up=('up', 'mean'),
+        up_unit=('up_unit', 'first'),
+        billing_start=('billing_start', 'min'),
+        contracts=('contract_ref', lambda x: ', '.join(sorted(set(str(v) for v in x if v)))),
+    )
+    int_summary['capacity_kwh_h'] = int_summary['total_qty_kwh_h'] / int_summary['num_days']
+    display(int_summary)
+    
+    # Daily detail
+    print("\nDaily detail (first 15 rows):")
+    display(df_interruptible.head(15))
+else:
+    print("No interruptible capacity lines found in this invoice.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Explore Interruptible Capacity — Endur
+# =============================================================================
+# EXPLORE INTERRUPTIBLE CAPACITY — ENDUR
+# =============================================================================
+
+# 1. What service_type values exist for Belgium capacity deals?
+print("SERVICE TYPES for Belgium capacity deals in Endur:")
+print("=" * 80)
+df_svc_types = spark.sql("""
+    SELECT d.service_type, d.instrument_type_name, COUNT(*) AS deal_count
+    FROM ms_atlas.endur_standard.deal_v2latest d
+    JOIN ms_atlas.endur_standard.profilevolume_v2latest pv ON d.deal_number = pv.deal_number
+    JOIN ms_vulcan_gpgtopm_plab.hub2hub_v1.location_country_mapping cm ON pv.location_id = cm.location_id
+    WHERE d.instrument_type_name IN ('COMM-CAP-EXIT', 'COMM-CAP-ENTRY')
+      AND cm.country_code = 'BE'
+      AND d.tran_status = 'Validated'
+    GROUP BY d.service_type, d.instrument_type_name
+    ORDER BY d.service_type, d.instrument_type_name
+""")
+display(df_svc_types)
+
+# 2. Look for interruptible deals specifically at Virtualys around April 2026
+print("\nINTERRUPTIBLE Belgium capacity deals (if any):")
+print("=" * 80)
+df_int_endur = spark.sql("""
+    SELECT d.deal_number, d.reference, d.service_type, d.instrument_type_name,
+           d.buy_sell_name, d.deal_start_date, d.deal_end_date,
+           l.location_name, pv.start_date, pv.end_date,
+           pv.calculated_profile_volume_kwh, pv.price, pv.settlement_type_id
+    FROM ms_atlas.endur_standard.deal_v2latest d
+    JOIN ms_atlas.endur_standard.profilevolume_v2latest pv ON d.deal_number = pv.deal_number
+    JOIN ms_atlas.endur_standard.location_v2latest l ON pv.location_id = l.location_id
+    JOIN ms_vulcan_gpgtopm_plab.hub2hub_v1.location_country_mapping cm ON pv.location_id = cm.location_id
+    WHERE d.instrument_type_name IN ('COMM-CAP-EXIT', 'COMM-CAP-ENTRY')
+      AND cm.country_code = 'BE'
+      AND d.tran_status = 'Validated'
+      AND d.service_type != 'Firm'
+    ORDER BY d.deal_start_date DESC
+    LIMIT 50
+""")
+print(f"Non-Firm deals found: {df_int_endur.count()}")
+display(df_int_endur)
+
+# 3. Also search by reference pattern matching the over-nomination contract
+print("\nSearch for SRV-OVERNOM or interruptible references:")
+print("=" * 80)
+df_overnom = spark.sql("""
+    SELECT d.deal_number, d.reference, d.service_type, d.instrument_type_name,
+           d.buy_sell_name, d.deal_start_date, d.deal_end_date,
+           l.location_name
+    FROM ms_atlas.endur_standard.deal_v2latest d
+    JOIN ms_atlas.endur_standard.profilevolume_v2latest pv ON d.deal_number = pv.deal_number
+    JOIN ms_atlas.endur_standard.location_v2latest l ON pv.location_id = l.location_id
+    JOIN ms_vulcan_gpgtopm_plab.hub2hub_v1.location_country_mapping cm ON pv.location_id = cm.location_id
+    WHERE cm.country_code = 'BE'
+      AND d.tran_status = 'Validated'
+      AND (LOWER(d.reference) LIKE '%overnom%' OR LOWER(d.reference) LIKE '%interr%' OR LOWER(d.reference) LIKE '%srv%')
+    ORDER BY d.deal_start_date DESC
+    LIMIT 50
+""")
+print(f"Overnom/interruptible reference deals found: {df_overnom.count()}")
+if df_overnom.count() > 0:
+    display(df_overnom)
+
+# 4. Check if there's a Virtualys entry deal for April 7, 2026 specifically
+print("\nVirtualys Entry deals covering April 2026:")
+print("=" * 80)
+df_virt_apr = spark.sql("""
+    SELECT d.deal_number, d.reference, d.service_type, d.instrument_type_name,
+           d.buy_sell_name, d.deal_start_date, d.deal_end_date,
+           l.location_name, pv.start_date, pv.end_date,
+           pv.calculated_profile_volume_kwh, pv.price,
+           pv.calculated_profile_volume_kwh / ((DATEDIFF(pv.end_date, pv.start_date) + 1) * 24) AS capacity_kwh_h
+    FROM ms_atlas.endur_standard.deal_v2latest d
+    JOIN ms_atlas.endur_standard.profilevolume_v2latest pv ON d.deal_number = pv.deal_number
+    JOIN ms_atlas.endur_standard.location_v2latest l ON pv.location_id = l.location_id
+    WHERE d.instrument_type_name = 'COMM-CAP-ENTRY'
+      AND d.tran_status = 'Validated'
+      AND LOWER(l.location_name) LIKE '%virtual%'
+      AND pv.start_date <= '2026-04-30' AND pv.end_date >= '2026-04-01'
+      AND pv.settlement_type_id = 1
+    ORDER BY d.service_type, d.deal_start_date
+""")
+print(f"Virtualys Entry deals for April 2026: {df_virt_apr.count()}")
+display(df_virt_apr)
+
+# COMMAND ----------
+
+# DBTITLE 1,Interruptible Capacity — Match & Flag
+# =============================================================================
+# INTERRUPTIBLE CAPACITY — MATCH & FLAG (testing — no catalog save)
+# =============================================================================
+
+# 1. Pull ALL interruptible Endur deals for Belgium covering the invoice period
+df_int_endur_match = spark.sql(f"""
+    WITH raw AS (
+        SELECT d.deal_number, d.reference, d.service_type,
+            CASE WHEN d.instrument_type_name='COMM-CAP-ENTRY' THEN 'Entry' ELSE 'Exit' END AS direction,
+            l.location_name,
+            CAST(DATE_TRUNC('month', pv.start_date) AS DATE) AS billing_month,
+            pv.start_date AS pv_start, pv.end_date AS pv_end,
+            pv.calculated_profile_volume_kwh AS vol,
+            pv.price,
+            pv.calculated_profile_volume_kwh / ((DATEDIFF(pv.end_date, pv.start_date) + 1) * 24) AS capacity_kwh_h,
+            pv.calculated_profile_volume_kwh * pv.price AS endur_eur,
+            ROW_NUMBER() OVER (PARTITION BY d.deal_number, pv.start_date ORDER BY pv.price DESC) AS rn
+        FROM ms_atlas.endur_standard.deal_v2latest d
+        JOIN ms_atlas.endur_standard.profilevolume_v2latest pv ON d.deal_number = pv.deal_number
+        JOIN ms_atlas.endur_standard.location_v2latest l ON pv.location_id = l.location_id
+        JOIN ms_vulcan_gpgtopm_plab.hub2hub_v1.location_country_mapping cm ON pv.location_id = cm.location_id
+        WHERE d.instrument_type_name IN ('COMM-CAP-EXIT', 'COMM-CAP-ENTRY')
+          AND d.service_type = 'Interruptible'
+          AND d.tran_status = 'Validated'
+          AND pv.settlement_type_id = 1 AND pv.price != 0
+          AND cm.country_code = 'BE'
+          AND pv.start_date <= '{month_end}' AND pv.end_date >= '{all_month_start}'
+    )
+    SELECT * FROM raw WHERE rn = 1
+""")
+
+int_endur_count = df_int_endur_match.count()
+print(f"Interruptible Endur deals covering invoice period ({all_month_start} to {month_end}): {int_endur_count}")
+if int_endur_count > 0:
+    display(df_int_endur_match.orderBy('pv_start', 'direction', 'location_name'))
+
+# 2. Build comparison: invoice interruptible vs Endur interruptible
+print(f"\n{'='*80}")
+print("INTERRUPTIBLE CAPACITY — COMPARISON")
+print(f"{'='*80}")
+
+if len(df_interruptible) == 0:
+    print("No interruptible lines in this invoice.")
+else:
+    # Map invoice locations to Endur location patterns
+    INT_ROUTE_MAP = {
+        ('Entry', 'Virtualys'):   {'endur_pattern': '%VIRTUAL%'},
+        ('Exit', 'Virtualys'):    {'endur_pattern': '%VIRTUAL%'},
+        ('Entry', 'ZPT'):         {'endur_pattern': '%ZBEE%'},
+        ('Exit', 'VIP BENE'):     {'endur_pattern': '%VIP_BENE%'},
+        ('Entry', 'Zeebrugge'):   {'endur_pattern': '%ZBHUBEE%'},
+        ('Exit', 'VIP THE-ZTP'):  {'endur_pattern': '%VIP THE-ZTP%'},
+        ('Exit', 'Zeebrugge LNG'):{'endur_pattern': '%Zeebrugge LNG%'},
+    }
+
+    # Group invoice interruptible by direction + location + gas_day
+    int_inv_daily = df_interruptible.groupby(
+        ['direction', 'location', 'gas_day', 'service_rate_type'], as_index=False
+    ).agg(
+        invoice_kwh_h=('qty_kwh_h', 'sum'),
+        invoice_eur=('billed_amount', 'sum'),
+        service_hours=('service_hours', 'first'),
+        contract_ref=('contract_ref', lambda x: ', '.join(sorted(set(str(v) for v in x if v)))),
+        detail=('detail', lambda x: ' | '.join(sorted(set(str(v) for v in x if v)))),
+    )
+
+    results = []
+    for _, row in int_inv_daily.iterrows():
+        d, loc, gd = row['direction'], row['location'], row['gas_day']
+        cfg = INT_ROUTE_MAP.get((d, loc))
+
+        endur_match = None
+        endur_cap = None
+        endur_eur = None
+        flag = None
+
+        if cfg and int_endur_count > 0:
+            # Try to match on direction + location pattern + date
+            matches = df_int_endur_match.filter(
+                (F.col('direction') == d) &
+                (F.lower(F.col('location_name')).like(cfg['endur_pattern'].lower())) &
+                (F.col('pv_start') <= F.lit(str(gd))) &
+                (F.col('pv_end') >= F.lit(str(gd)))
+            ).collect()
+
+            if matches:
+                endur_cap = sum(abs(m['capacity_kwh_h']) for m in matches)
+                endur_eur = sum(abs(m['endur_eur']) for m in matches)
+                endur_match = ', '.join(m['reference'] for m in matches)
+                gap_pct = abs(row['invoice_kwh_h'] - endur_cap) / row['invoice_kwh_h'] * 100 if row['invoice_kwh_h'] else 0
+                flag = 'MATCHED' if gap_pct < 2 else f'CAPACITY GAP ({gap_pct:.1f}%)'
+            else:
+                flag = 'NO ENDUR MATCH — likely over-nomination'
+        else:
+            flag = 'NO ENDUR MATCH — likely over-nomination'
+
+        results.append({
+            'direction': d,
+            'location': loc,
+            'gas_day': gd,
+            'rate_type': row['service_rate_type'],
+            'service_hours': row['service_hours'],
+            'invoice_kwh_h': row['invoice_kwh_h'],
+            'invoice_eur': row['invoice_eur'],
+            'endur_kwh_h': endur_cap,
+            'endur_eur': endur_eur,
+            'endur_reference': endur_match,
+            'contract_ref': row['contract_ref'],
+            'detail': row['detail'],
+            'flag': flag,
+        })
+
+    df_int_results = pd.DataFrame(results)
+    display(df_int_results)
+
+    # Summary
+    print(f"\n{'='*80}")
+    print("INTERRUPTIBLE SUMMARY")
+    print(f"{'='*80}")
+    total_inv = df_int_results['invoice_eur'].sum()
+    matched = df_int_results[df_int_results['flag'] == 'MATCHED']
+    unmatched = df_int_results[df_int_results['flag'] != 'MATCHED']
+    print(f"  Total interruptible invoiced: €{total_inv:,.2f}")
+    print(f"  Matched to Endur:  {len(matched)} line(s)")
+    print(f"  Unmatched/flagged: {len(unmatched)} line(s)")
+    for _, u in unmatched.iterrows():
+        print(f"    ⚠️ {u['direction']} {u['location']} ({u['gas_day']}): {u['invoice_kwh_h']:,.0f} kWh/h, €{u['invoice_eur']:,.2f} — {u['flag']}")
+        print(f"       Contract: {u['contract_ref']} | Detail: {u['detail']}")
