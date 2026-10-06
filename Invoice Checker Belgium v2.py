@@ -10,7 +10,7 @@
 # MAGIC Combined invoice checker merging three Belgium Fluxys invoice checks into a single notebook.
 # MAGIC
 # MAGIC **Checks performed:**
-# MAGIC 1. **Long Term Capacity (LTC)** — Entry/Exit at IC Point (Firm) capacity bookings vs Endur deals
+# MAGIC 1. **Long Term Capacity (LTC)** — Entry/Exit at IC Point (Firm + Interruptible) capacity bookings vs Endur deals
 # MAGIC 2. **Allocation Settlement** — Purchases (bill) and Sales (self-bill) at end-user domestic points vs dispatch deltas
 # MAGIC 3. **Variable Trading Fee** — ZTP Trading variable fee vs ZTPH shipper volumes
 # MAGIC
@@ -20,7 +20,7 @@
 # MAGIC
 # MAGIC | Table | Contents |
 # MAGIC |---|---|
-# MAGIC | `be_longterm_results` | LTC comparison — Entry/Exit at IC Point (Firm) |
+# MAGIC | `be_longterm_results` | LTC comparison — Entry/Exit at IC Point (Firm + Interruptible) |
 # MAGIC | `be_longterm_flagged` | LTC flagged issues (capacity mismatches, back-billing) |
 # MAGIC | `be_allocsettle_daily` | Allocation settlement daily comparison grid |
 # MAGIC | `be_allocsettle_summary` | Allocation settlement monthly summary |
@@ -509,7 +509,7 @@ df_endur = spark.sql(f"""
           AND pv2.settlement_type_id=1 AND pv2.price>0 AND LOWER(d2.reference) NOT LIKE '%conversion%'
     ),
     raw AS (
-        SELECT d.deal_number, d.reference,
+        SELECT d.deal_number, d.reference, d.service_type AS endur_capacity_type,
             CASE WHEN d.instrument_type_name='COMM-CAP-ENTRY' THEN 'Entry' ELSE 'Exit' END AS direction,
             CASE WHEN d.reference LIKE 'PRI-%' THEN SPLIT(d.reference,'-')[2] ELSE NULL END AS allocation_id,
             l.location_name,
@@ -605,6 +605,7 @@ annualized_price_col = F.when(
 for _, r in compare_base.iterrows():
     bm, d, loc = r['billing_month'], r['direction'], r['location']
     rate_type = r['service_rate_type']
+    cap_type = r['capacity_type']
     cfg = ROUTE_MAP.get((d, loc))
     endur_locs = cfg['endur'] if cfg else None
     cap_type = r['capacity_type']
@@ -713,7 +714,8 @@ for _, r in df_comparison.iterrows():
     gas_day = bm
     if lt == 'Tariff':
         if r['endur_kwh_h'] is None or pd.isna(r['endur_kwh_h']):
-            flags.append({'type': rate_type, 'gas_day': gas_day, 'direction': d, 'location': loc,
+            flags.append({'type': rate_type, 'capacity_type': r.get('capacity_type', 'Firm'),
+                'gas_day': gas_day, 'direction': d, 'location': loc,
                 'invoice_value': r['invoice_kwh_h'], 'endur_value': None,
                 'gap': None, 'gap_pct': None, 'unit': 'kWh/h', 'capacity_type': cap_type, 'note': f'NO ENDUR MATCH [{cap_type}]'})
         else:
@@ -721,11 +723,13 @@ for _, r in df_comparison.iterrows():
                 gap = r['endur_kwh_h'] - r['invoice_kwh_h']
                 gap_pct = round(gap / r['invoice_kwh_h'] * 100, 3) if r['invoice_kwh_h'] else None
                 if gap_pct is not None and abs(gap_pct) > 1:
-                    flags.append({'type': rate_type, 'gas_day': gas_day, 'direction': d, 'location': loc,
+                    flags.append({'type': rate_type, 'capacity_type': r.get('capacity_type', 'Firm'),
+                        'gas_day': gas_day, 'direction': d, 'location': loc,
                         'invoice_value': r['invoice_kwh_h'], 'endur_value': r['endur_kwh_h'],
                         'gap': gap, 'gap_pct': gap_pct, 'unit': 'kWh/h', 'capacity_type': cap_type, 'note': f'capacity rate mismatch [{cap_type}]'})
             if r.get('price_gap_pct') is not None and abs(r['price_gap_pct']) > 1:
-                flags.append({'type': rate_type, 'gas_day': gas_day, 'direction': d, 'location': loc,
+                flags.append({'type': rate_type, 'capacity_type': r.get('capacity_type', 'Firm'),
+                    'gas_day': gas_day, 'direction': d, 'location': loc,
                     'invoice_value': r.get('invoice_price'), 'endur_value': r.get('endur_price'),
                     'gap': r.get('price_gap'), 'gap_pct': r.get('price_gap_pct'),
                     'unit': r.get('price_unit'), 'capacity_type': cap_type, 'note': f'price mismatch [{cap_type}]'})
@@ -733,7 +737,8 @@ for _, r in df_comparison.iterrows():
         if r['gap_eur'] is not None and r['invoice_eur']:
             gap_pct = round(r['gap_eur'] / r['invoice_eur'] * 100, 3)
             if abs(gap_pct) > 1:
-                flags.append({'type': 'AuctionPremium', 'gas_day': gas_day, 'direction': d, 'location': loc,
+                flags.append({'type': 'AuctionPremium', 'capacity_type': r.get('capacity_type', 'Firm'),
+                    'gas_day': gas_day, 'direction': d, 'location': loc,
                     'invoice_value': r['invoice_eur'], 'endur_value': r['equinor_eur'],
                     'gap': r['gap_eur'], 'gap_pct': gap_pct, 'unit': 'EUR', 'capacity_type': cap_type, 'note': f'auction premium EUR mismatch [{cap_type}]'})
 
