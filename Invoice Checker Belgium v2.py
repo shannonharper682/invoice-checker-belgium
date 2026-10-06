@@ -99,7 +99,9 @@
 # MAGIC             if len(pdf) > 0:
 # MAGIC                 spark.createDataFrame(pdf).write.option("mergeSchema", "true").saveAsTable(table_fqn)
 # MAGIC             else:
-# MAGIC                 print(f"  \u26a0\ufe0f {table_fqn} — no data and table doesn't exist yet")
+# MAGIC                 # Create empty table so dashboard widgets can still render
+# MAGIC                 spark.sql(f"CREATE TABLE IF NOT EXISTS {table_fqn} (check_month STRING) USING DELTA")
+# MAGIC                 print(f"  \u2705 {table_fqn} — 0 rows (empty table created)")
 # MAGIC                 return
 # MAGIC         else:
 # MAGIC             raise
@@ -120,16 +122,18 @@
 
 # DBTITLE 1,Parse Invoice XML
 # =============================================================================
-# PARSER 1: LTC — Extract IC Point capacity lines (Firm)
+# PARSER 1: LTC — Extract IC Point capacity lines (Firm + Interruptible)
 # =============================================================================
 def parse_invoice(path):
     tree = ET.parse(path)
     rows = []
-    VALID = ('Entry at Interconnection Point (Firm)', 'Exit at Interconnection Point (Firm)')
+    VALID = ('Entry at Interconnection Point (Firm)', 'Exit at Interconnection Point (Firm)',
+             'Entry at Interconnection Point (Interruptible)', 'Exit at Interconnection Point (Interruptible)')
     for prod in tree.getroot().iter('CustomerProduct'):
         pname = (prod.findtext('ProductName') or '').strip()
         if not (pname.startswith(VALID) or 'Auction' in pname or 'Premium' in pname):
             continue
+        _cap_type = 'Interruptible' if 'Interruptible' in pname else 'Firm'
         for il in prod.findall('./InvoiceLines/InvoiceLine'):
             for bq in il.findall('.//BilledQuantity'):
                 ai, pfi = bq.find('AdditionalInformation'), bq.find('PriceFormulaInformation')
@@ -142,6 +146,7 @@ def parse_invoice(path):
                 if service_hours <= 0: service_hours += 24
                 qty_val = float(qty_el.get('QTY', 0)) if qty_el is not None else None
                 rows.append({
+                    'capacity_type': _cap_type,
                     'invoice_line_group': (il.findtext('InvoiceLineGroup') or '').strip(),
                     'location': (il.findtext('InvoiceLine') or '').strip(),
                     'detail': (il.findtext('InvoiceLineDetail') or '').strip(),
@@ -259,14 +264,15 @@ all_month_start = billing_months[0]
 
 IC = ['Entry at Interconnection Point - Firm', 'Exit at Interconnection Point - Firm',
       'Auction Premium on Exit at Interconnection Point - Firm',
-      'Auction Premium on Entry at Interconnection Point - Firm']
+      'Auction Premium on Entry at Interconnection Point - Firm',
+      'Entry at Interconnection Point - Interruptible', 'Exit at Interconnection Point - Interruptible']
 df_lt = df_all_ltc[df_all_ltc['invoice_line_group'].isin(IC)].copy()
 df_lt['billing_month'] = df_lt['billing_start'].apply(lambda d: d.replace(day=1) if d else None)
 
 is_auc = df_lt['detail'].str.contains('Auction|Premium', case=False, na=False)
 def _contracts(x): return ', '.join(sorted(set(str(v) for v in x if v)))
 
-summary = df_lt[~is_auc].groupby(['billing_month', 'direction', 'location', 'detail', 'service_rate_type'], as_index=False).agg(
+summary = df_lt[~is_auc].groupby(['billing_month', 'direction', 'location', 'detail', 'service_rate_type', 'capacity_type'], as_index=False).agg(
     tariff_eur=('billed_amount', 'sum'), total_qty_kwh_h=('qty', 'sum'),
     total_volume_kwh=('volume_kwh', 'sum'), num_days=('gas_day', 'nunique'),
     up=('up', 'first'), up_unit=('up_unit', 'first'),
@@ -279,13 +285,17 @@ auc_summary = (df_lt[is_auc].groupby(['billing_month', 'direction', 'location'],
 
 print(f"\n--- LONG TERM CAPACITY ---")
 print(f"Invoice month (M): {invoice_month}  |  Previous (M-1): {billing_months[0] if len(billing_months) > 1 else 'N/A'}")
-print(f"IC capacity lines: {(~is_auc).sum()} tariff + {is_auc.sum()} auction")
+firm_count = len(df_lt[df_lt['capacity_type'] == 'Firm'])
+int_count = len(df_lt[df_lt['capacity_type'] == 'Interruptible'])
+print(f"IC capacity lines: {(~is_auc).sum()} tariff + {is_auc.sum()} auction  (Firm: {firm_count}, Interruptible: {int_count})")
 for bm in billing_months:
     bm_rows = summary[summary['billing_month'] == bm]
     label = 'M' if bm == invoice_month else 'M-1'
-    lt_count = len(bm_rows[bm_rows['service_rate_type'] == 'LongTerm'])
-    seas_count = len(bm_rows[bm_rows['service_rate_type'] == 'Season'])
-    print(f"  {bm} ({label}): {lt_count} long-term + {seas_count} seasonal groups")
+    for ct in sorted(bm_rows['capacity_type'].unique()):
+        ct_rows = bm_rows[bm_rows['capacity_type'] == ct]
+        lt_count = len(ct_rows[ct_rows['service_rate_type'] == 'LongTerm'])
+        seas_count = len(ct_rows[ct_rows['service_rate_type'] == 'Season'])
+        print(f"  {bm} ({label}) [{ct}]: {lt_count} long-term + {seas_count} seasonal groups")
 
 # --- 2. Variable Fee & Energy in Cash parsing ---
 # Both are billed ~3 months in arrears — detect period from actual gas_days
@@ -376,9 +386,9 @@ print(f"{'='*80}")
 
 # --- LTC Summary ---
 print(f"\n\u2501\u2501 LONG TERM CAPACITY ({invoice_month.strftime('%B %Y')}) \u2501\u2501")
-ltc_summary_display = summary[['billing_month', 'direction', 'location', 'service_rate_type',
+ltc_summary_display = summary[['billing_month', 'capacity_type', 'direction', 'location', 'service_rate_type',
     'capacity_kwh_h', 'tariff_eur', 'num_days', 'up', 'up_unit']].copy()
-ltc_summary_display.columns = ['Billing Month', 'Direction', 'Location', 'Rate Type',
+ltc_summary_display.columns = ['Billing Month', 'Capacity Type', 'Direction', 'Location', 'Rate Type',
     'Capacity kWh/h', 'Tariff EUR', 'Days', 'Unit Price', 'Unit']
 if len(auc_summary) > 0:
     auc_display = auc_summary[['billing_month', 'direction', 'location', 'auction_eur']].copy()
@@ -495,7 +505,7 @@ df_endur = spark.sql(f"""
         FROM ms_atlas.endur_standard.deal_v2latest d2
         JOIN ms_atlas.endur_standard.profilevolume_v2latest pv2 ON d2.deal_number = pv2.deal_number
         WHERE d2.instrument_type_name IN ('COMM-CAP-EXIT','COMM-CAP-ENTRY')
-          AND d2.buy_sell_name='Sell' AND d2.service_type='Firm' AND d2.tran_status='Validated'
+          AND d2.buy_sell_name='Sell' AND d2.service_type IN ('Firm','Interruptible') AND d2.tran_status='Validated'
           AND pv2.settlement_type_id=1 AND pv2.price>0 AND LOWER(d2.reference) NOT LIKE '%conversion%'
     ),
     raw AS (
@@ -515,13 +525,14 @@ df_endur = spark.sql(f"""
                 WHEN DATEDIFF(d.deal_end_date, d.deal_start_date) >= 27 THEN 'Monthly'
                 ELSE 'Daily'
             END AS booking_type,
+            d.service_type AS endur_capacity_type,
             ROW_NUMBER() OVER (PARTITION BY d.deal_number, pv.start_date ORDER BY pv.price DESC) AS rn
         FROM ms_atlas.endur_standard.deal_v2latest d
         JOIN ms_atlas.endur_standard.profilevolume_v2latest pv ON d.deal_number=pv.deal_number
         JOIN ms_atlas.endur_standard.location_v2latest l ON pv.location_id=l.location_id
         JOIN ms_vulcan_gpgtopm_plab.hub2hub_v1.location_country_mapping cm ON pv.location_id=cm.location_id
         WHERE d.instrument_type_name IN ('COMM-CAP-EXIT','COMM-CAP-ENTRY')
-          AND d.service_type='Firm' AND d.tran_status='Validated' AND pv.settlement_type_id=1
+          AND d.service_type IN ('Firm','Interruptible') AND d.tran_status='Validated' AND pv.settlement_type_id=1
           AND (pv.price!=0 OR (d.reference LIKE 'PRI_SEC_%' AND d.buy_sell_name='Sell'
                AND pv.location_id IN (SELECT location_id FROM net_billed)))
           AND cm.country_code='BE'
@@ -544,17 +555,21 @@ lt_count = df_longterm.count()
 seas_count = df_seasonal.count()
 print(f"\nEndur deals ({_sql_start} to {month_end}): {lt_count} long-term + {seas_count} seasonal")
 for bm in billing_months:
-    lt_ct = df_longterm.filter(F.col('billing_month') == str(bm)).count()
-    seas_ct = df_seasonal.filter(F.col('billing_month') == str(bm)).count()
+    lt_bm = df_longterm.filter(F.col('billing_month') == str(bm))
+    seas_bm = df_seasonal.filter(F.col('billing_month') == str(bm))
+    lt_ct = lt_bm.count()
+    seas_ct = seas_bm.count()
+    lt_f = lt_bm.filter(F.col('endur_capacity_type') == 'Firm').count()
+    lt_i = lt_bm.filter(F.col('endur_capacity_type') == 'Interruptible').count()
     label = 'M' if bm == invoice_month else 'M-1'
-    print(f"  {bm} ({label}): {lt_ct} long-term + {seas_ct} seasonal deals")
+    print(f"  {bm} ({label}): {lt_ct} long-term (F:{lt_f} I:{lt_i}) + {seas_ct} seasonal deals")
 
 print(f"\n--- Long-term deals ---")
-display(df_longterm.select('deal_number','reference','direction','location_name','billing_month','booking_type','vol','price','capacity_kwh_h','endur_eur')
+display(df_longterm.select('deal_number','reference','direction','location_name','billing_month','booking_type','endur_capacity_type','vol','price','capacity_kwh_h','endur_eur')
     .orderBy('billing_month','direction','location_name'))
 if seas_count > 0:
     print(f"\n--- Seasonal deals (sample) ---")
-    display(df_seasonal.select('deal_number','reference','direction','location_name','pv_start','booking_type','vol','price','capacity_kwh_h','endur_eur')
+    display(df_seasonal.select('deal_number','reference','direction','location_name','pv_start','booking_type','endur_capacity_type','vol','price','capacity_kwh_h','endur_eur')
         .orderBy('pv_start','direction','location_name').limit(20))
 
 # COMMAND ----------
@@ -565,7 +580,7 @@ if seas_count > 0:
 # =============================================================================
 compare_base = (
     df_lt[~is_auc]
-    .groupby(['billing_month', 'direction', 'location', 'service_rate_type'], as_index=False)
+    .groupby(['billing_month', 'direction', 'location', 'service_rate_type', 'capacity_type'], as_index=False)
     .agg(
         tariff_eur=('billed_amount', 'sum'),
         total_qty_kwh_h=('qty', 'sum'),
@@ -592,7 +607,9 @@ for _, r in compare_base.iterrows():
     rate_type = r['service_rate_type']
     cfg = ROUTE_MAP.get((d, loc))
     endur_locs = cfg['endur'] if cfg else None
+    cap_type = r['capacity_type']
     endur_df = df_longterm if rate_type == 'LongTerm' else df_seasonal
+    endur_df = endur_df.filter(F.col('endur_capacity_type') == cap_type)
     days_in_month = calendar.monthrange(bm.year, bm.month)[1]
 
     e_cap = e_eur = endur_price = None
@@ -648,7 +665,7 @@ for _, r in compare_base.iterrows():
         price_gap = 0.0 if invoice_price is not None else None
         price_gap_pct = 0.0 if invoice_price is not None else None
     rows.append({
-        'billing_month': str(bm), 'direction': d, 'location': loc, 'line_type': 'Tariff',
+        'billing_month': str(bm), 'direction': d, 'location': loc, 'capacity_type': cap_type, 'line_type': 'Tariff',
         'service_rate_type': rate_type, 'detail': r['detail'],
         'invoice_kwh_h': round(r['invoice_kwh_h'], 2),
         'endur_kwh_h': round(e_cap, 2) if e_cap is not None else None,
@@ -667,7 +684,7 @@ for _, r in compare_base.iterrows():
             base_tariff_eur = r['invoice_kwh_h'] * invoice_price * days_in_month / 365 if rate_type == 'LongTerm' else r['total_volume_kwh'] * invoice_price
         auc_endur = (e_eur - base_tariff_eur) if (e_eur is not None and base_tariff_eur is not None) else None
         rows.append({
-            'billing_month': str(bm), 'direction': d, 'location': loc, 'line_type': 'Auction Premium',
+            'billing_month': str(bm), 'direction': d, 'location': loc, 'capacity_type': cap_type, 'line_type': 'Auction Premium',
             'service_rate_type': rate_type, 'detail': 'Auction Premium',
             'invoice_kwh_h': None, 'endur_kwh_h': None,
             'invoice_eur': round(auc_eur, 2),
@@ -691,13 +708,14 @@ for bm in billing_months:
 flags = []
 for _, r in df_comparison.iterrows():
     bm, d, loc, lt = r['billing_month'], r['direction'], r['location'], r['line_type']
+    cap_type = r.get('capacity_type', 'Firm')
     rate_type = r.get('service_rate_type', 'LongTerm')
     gas_day = bm
     if lt == 'Tariff':
         if r['endur_kwh_h'] is None or pd.isna(r['endur_kwh_h']):
             flags.append({'type': rate_type, 'gas_day': gas_day, 'direction': d, 'location': loc,
                 'invoice_value': r['invoice_kwh_h'], 'endur_value': None,
-                'gap': None, 'gap_pct': None, 'unit': 'kWh/h', 'note': 'NO ENDUR MATCH'})
+                'gap': None, 'gap_pct': None, 'unit': 'kWh/h', 'capacity_type': cap_type, 'note': f'NO ENDUR MATCH [{cap_type}]'})
         else:
             if r['endur_kwh_h'] != r['invoice_kwh_h']:
                 gap = r['endur_kwh_h'] - r['invoice_kwh_h']
@@ -705,42 +723,44 @@ for _, r in df_comparison.iterrows():
                 if gap_pct is not None and abs(gap_pct) > 1:
                     flags.append({'type': rate_type, 'gas_day': gas_day, 'direction': d, 'location': loc,
                         'invoice_value': r['invoice_kwh_h'], 'endur_value': r['endur_kwh_h'],
-                        'gap': gap, 'gap_pct': gap_pct, 'unit': 'kWh/h', 'note': 'capacity rate mismatch'})
+                        'gap': gap, 'gap_pct': gap_pct, 'unit': 'kWh/h', 'capacity_type': cap_type, 'note': f'capacity rate mismatch [{cap_type}]'})
             if r.get('price_gap_pct') is not None and abs(r['price_gap_pct']) > 1:
                 flags.append({'type': rate_type, 'gas_day': gas_day, 'direction': d, 'location': loc,
                     'invoice_value': r.get('invoice_price'), 'endur_value': r.get('endur_price'),
                     'gap': r.get('price_gap'), 'gap_pct': r.get('price_gap_pct'),
-                    'unit': r.get('price_unit'), 'note': 'price mismatch'})
+                    'unit': r.get('price_unit'), 'capacity_type': cap_type, 'note': f'price mismatch [{cap_type}]'})
     elif lt == 'Auction Premium':
         if r['gap_eur'] is not None and r['invoice_eur']:
             gap_pct = round(r['gap_eur'] / r['invoice_eur'] * 100, 3)
             if abs(gap_pct) > 1:
                 flags.append({'type': 'AuctionPremium', 'gas_day': gas_day, 'direction': d, 'location': loc,
                     'invoice_value': r['invoice_eur'], 'endur_value': r['equinor_eur'],
-                    'gap': r['gap_eur'], 'gap_pct': gap_pct, 'unit': 'EUR', 'note': 'auction premium EUR mismatch'})
+                    'gap': r['gap_eur'], 'gap_pct': gap_pct, 'unit': 'EUR', 'capacity_type': cap_type, 'note': f'auction premium EUR mismatch [{cap_type}]'})
 
 # Endur-only routes
 for bm in billing_months:
-    inv_routes = set((r['direction'], r['location']) for _, r in compare_base[compare_base['billing_month'] == bm].iterrows())
+    inv_routes = set((r['direction'], r['location'], r['capacity_type']) for _, r in compare_base[compare_base['billing_month'] == bm].iterrows())
     for (d, loc), cfg in ROUTE_MAP.items():
         if bm != invoice_month and cfg['type'] == 'longterm': continue
-        if (d, loc) in inv_routes: continue
-        endur_locs = cfg['endur']
-        endur_df = df_longterm if cfg['type'] == 'longterm' else df_seasonal
-        agg = endur_df.filter((F.col('location_name').isin(endur_locs)) & (F.col('billing_month') == str(bm))).agg(
-            F.abs(F.sum(F.col('capacity_kwh_h'))).alias('cap_net'),
-            F.sum(F.abs(F.col('capacity_kwh_h'))).alias('cap_sum'),
-            F.countDistinct(F.col('pv_start').cast('date')).alias('distinct_days')
-        ).collect()[0]
-        endur_cap = None
-        if agg['cap_net'] or agg['cap_sum']:
-            endur_cap = float(agg['cap_net']) if cfg['type'] == 'longterm' else (
-                float(agg['cap_sum']) / float(agg['distinct_days']) if agg['distinct_days'] else None)
-        if endur_cap and endur_cap > 0:
-            flags.append({'type': 'LongTerm' if cfg['type'] == 'longterm' else 'Season',
-                'gas_day': str(bm), 'direction': d, 'location': loc,
-                'invoice_value': None, 'endur_value': endur_cap,
-                'gap': None, 'gap_pct': None, 'unit': 'kWh/h', 'note': 'ENDUR ONLY (not invoiced)'})
+        for _ect in ['Firm', 'Interruptible']:
+            if (d, loc, _ect) in inv_routes: continue
+            endur_locs = cfg['endur']
+            endur_df = df_longterm if cfg['type'] == 'longterm' else df_seasonal
+            endur_df = endur_df.filter(F.col('endur_capacity_type') == _ect)
+            agg = endur_df.filter((F.col('location_name').isin(endur_locs)) & (F.col('billing_month') == str(bm))).agg(
+                F.abs(F.sum(F.col('capacity_kwh_h'))).alias('cap_net'),
+                F.sum(F.abs(F.col('capacity_kwh_h'))).alias('cap_sum'),
+                F.countDistinct(F.col('pv_start').cast('date')).alias('distinct_days')
+            ).collect()[0]
+            endur_cap = None
+            if agg['cap_net'] or agg['cap_sum']:
+                endur_cap = float(agg['cap_net']) if cfg['type'] == 'longterm' else (
+                    float(agg['cap_sum']) / float(agg['distinct_days']) if agg['distinct_days'] else None)
+            if endur_cap and endur_cap > 0:
+                flags.append({'type': 'LongTerm' if cfg['type'] == 'longterm' else 'Season',
+                    'gas_day': str(bm), 'direction': d, 'location': loc, 'capacity_type': _ect,
+                    'invoice_value': None, 'endur_value': endur_cap,
+                    'gap': None, 'gap_pct': None, 'unit': 'kWh/h', 'note': f'ENDUR ONLY [{_ect}] (not invoiced)'})
 
 ltc_flags = pd.DataFrame(flags)
 if len(ltc_flags) > 0:
@@ -985,54 +1005,6 @@ else:
         display(alloc_flagged)
     else:
         print(f"\n\u2705 No flagged days \u2014 all daily entries match within tolerance.")
-
-# COMMAND ----------
-
-# DBTITLE 1,Allocation Settlement — Save
-# =============================================================================
-# ALLOCATION SETTLEMENT — SAVE TO DELTA
-# =============================================================================
-if not HAS_ALLOC:
-    print("Allocation settlement save skipped.")
-else:
-    run_ts = datetime.now()
-    print(f"Saving allocation settlement \u2014 {SETTLE_MONTH_LABEL} ({SETTLE_CK}):")
-    _d = alloc_comp.copy()
-    _d['bill_price_diff'] = pd.to_numeric(_d['bill_price_diff'], errors='coerce')
-    _d['sb_price_diff'] = pd.to_numeric(_d['sb_price_diff'], errors='coerce')
-    _d['check_month'] = SETTLE_CK
-    _d['run_timestamp'] = run_ts
-    _save_delta(_d, ALLOC_DAILY_TABLE, SETTLE_CK)
-    _s = pd.DataFrame([
-        {'line': 'Purchases', 'invoice_kwh': float(inv_purch_kwh), 'invoice_eur': float(inv_purch_eur),
-         'equinor_kwh': float(eq_purch_kwh) if has_final else None,
-         'equinor_eur': float(eq_purch_eur) if has_final else None,
-         'diff_eur': float(purch_diff) if has_final else None, 'status': _flag('purch', purch_diff)},
-        {'line': 'Sales', 'invoice_kwh': float(inv_sale_kwh), 'invoice_eur': float(inv_sale_eur),
-         'equinor_kwh': float(eq_sale_kwh) if has_final else None,
-         'equinor_eur': float(eq_sale_eur) if has_final else None,
-         'diff_eur': float(sale_diff) if has_final else None, 'status': _flag('sale', sale_diff)},
-        {'line': 'Net', 'invoice_kwh': float(inv_sale_kwh - inv_purch_kwh),
-         'invoice_eur': float(inv_sale_eur - inv_purch_eur),
-         'equinor_kwh': float(eq_sale_kwh - eq_purch_kwh) if has_final else None,
-         'equinor_eur': float(eq_sale_eur - eq_purch_eur) if has_final else None,
-         'diff_eur': float(net_diff) if has_final else None, 'status': _flag('net', net_diff)},
-        {'line': 'ZTP Price Check', 'invoice_kwh': None, 'invoice_eur': None,
-         'equinor_kwh': None, 'equinor_eur': None, 'diff_eur': None,
-         'status': '\u2705 All match' if all_price_ok else '\u26a0\ufe0f Mismatch found'},
-    ])
-    _s['invoice_month'] = ALLOC_INVOICE_MONTH
-    _s['check_month'] = SETTLE_CK
-    _s['run_timestamp'] = run_ts
-    _save_delta(_s, ALLOC_SUMMARY_TABLE, SETTLE_CK)
-    _f = alloc_flagged.copy()
-    if len(_f) > 0:
-        _f['bill_price_diff'] = pd.to_numeric(_f['bill_price_diff'], errors='coerce')
-        _f['sb_price_diff'] = pd.to_numeric(_f['sb_price_diff'], errors='coerce')
-        _f['check_month'] = SETTLE_CK
-        _f['run_timestamp'] = run_ts
-    _save_delta(_f, ALLOC_FLAGS_TABLE, SETTLE_CK)
-    print(f"Allocation settlement save complete.")
 
 # COMMAND ----------
 
@@ -1605,601 +1577,6 @@ else:
     else:
         print(f"  \u26a0\ufe0f Allocation Settlement ({SETTLE_MONTH_LABEL}): {alloc_flag_count} day(s) flagged")
 
-if len(vf) == 0:
-    print(f"  \u23ed\ufe0f Variable Trading Fee: SKIPPED (not in this invoice)")
-elif vf_verdict == 'SKIPPED':
-    print(f"  \u23ed\ufe0f Variable Trading Fee: SKIPPED (no ZTPH data)")
-elif vf_verdict == 'VERIFIED':
-    print(f"  \u2705 Variable Trading Fee ({CHECK_MONTH}): PASS \u2014 {vf_verdict}")
-else:
-    print(f"  \u26a0\ufe0f Variable Trading Fee ({CHECK_MONTH}): {vf_verdict} \u2014 {vf_num_flagged} day(s) flagged")
-
-print(f"\n{'='*80}")
-print(f"All results saved to {NEW_SCHEMA}")
-print(f"{'='*80}")
-
-# COMMAND ----------
-
-# DBTITLE 1,Allocation Settlement — Save
-# =============================================================================
-# ALLOCATION SETTLEMENT — SAVE TO DELTA
-# =============================================================================
-
-if not HAS_ALLOC:
-    print("Allocation settlement save skipped.")
-else:
-    run_ts = datetime.now()
-    print(f"Saving allocation settlement \u2014 {SETTLE_MONTH_LABEL} ({SETTLE_CK}):")
-
-    # --- Daily grid ---
-    _d = alloc_comp.copy()
-    _d['bill_price_diff'] = pd.to_numeric(_d['bill_price_diff'], errors='coerce')
-    _d['sb_price_diff'] = pd.to_numeric(_d['sb_price_diff'], errors='coerce')
-    _d['check_month'] = SETTLE_CK
-    _d['run_timestamp'] = run_ts
-    _save_delta(_d, ALLOC_DAILY_TABLE, SETTLE_CK)
-
-    # --- Monthly summary ---
-    _s = pd.DataFrame([
-        {'line': 'Purchases', 'invoice_kwh': float(inv_purch_kwh), 'invoice_eur': float(inv_purch_eur),
-         'equinor_kwh': float(eq_purch_kwh) if has_final else None,
-         'equinor_eur': float(eq_purch_eur) if has_final else None,
-         'diff_eur': float(purch_diff) if has_final else None, 'status': _flag('purch', purch_diff)},
-        {'line': 'Sales', 'invoice_kwh': float(inv_sale_kwh), 'invoice_eur': float(inv_sale_eur),
-         'equinor_kwh': float(eq_sale_kwh) if has_final else None,
-         'equinor_eur': float(eq_sale_eur) if has_final else None,
-         'diff_eur': float(sale_diff) if has_final else None, 'status': _flag('sale', sale_diff)},
-        {'line': 'Net', 'invoice_kwh': float(inv_sale_kwh - inv_purch_kwh),
-         'invoice_eur': float(inv_sale_eur - inv_purch_eur),
-         'equinor_kwh': float(eq_sale_kwh - eq_purch_kwh) if has_final else None,
-         'equinor_eur': float(eq_sale_eur - eq_purch_eur) if has_final else None,
-         'diff_eur': float(net_diff) if has_final else None, 'status': _flag('net', net_diff)},
-        {'line': 'ZTP Price Check', 'invoice_kwh': None, 'invoice_eur': None,
-         'equinor_kwh': None, 'equinor_eur': None, 'diff_eur': None,
-         'status': '\u2705 All match' if all_price_ok else '\u26a0\ufe0f Mismatch found'},
-    ])
-    _s['invoice_month'] = ALLOC_INVOICE_MONTH
-    _s['check_month'] = SETTLE_CK
-    _s['run_timestamp'] = run_ts
-    _save_delta(_s, ALLOC_SUMMARY_TABLE, SETTLE_CK)
-
-    # --- Flagged entries ---
-    _f = alloc_flagged.copy()
-    if len(_f) > 0:
-        _f['bill_price_diff'] = pd.to_numeric(_f['bill_price_diff'], errors='coerce')
-        _f['sb_price_diff'] = pd.to_numeric(_f['sb_price_diff'], errors='coerce')
-        _f['check_month'] = SETTLE_CK
-        _f['run_timestamp'] = run_ts
-    _save_delta(_f, ALLOC_FLAGS_TABLE, SETTLE_CK)
-    print(f"\nAllocation settlement save complete.")
-
-# COMMAND ----------
-
-# DBTITLE 1,Variable Fee — Parse Invoice
-# =============================================================================
-# VARIABLE TRADING FEE — PARSE INVOICE
-# =============================================================================
-if len(vf) == 0:
-    print(f"\u26a0\ufe0f No Variable Fee (ZTP Trading) entries in this invoice for {CHECK_MONTH}")
-    vf_daily = pd.DataFrame()
-else:
-    entry = vf[vf['direction'] == 'Entry'].groupby('gas_day').agg(
-        entry_qty_mwh=('qty', 'sum'), up_eur_mwh=('up', 'first'),
-        entry_amount_eur=('amount', 'sum')).reset_index()
-    exit_ = vf[vf['direction'] == 'Exit'].groupby('gas_day').agg(
-        exit_qty_mwh=('qty', 'sum'), exit_amount_eur=('amount', 'sum')).reset_index()
-    vf_daily = entry.merge(exit_, on='gas_day', how='outer').sort_values('gas_day').reset_index(drop=True)
-    vf_daily['total_amount_eur'] = vf_daily['entry_amount_eur'] + vf_daily['exit_amount_eur']
-    print(f"\n{'='*70}")
-    print(f"VARIABLE FEE (ZTP Trading) \u2014 DAILY ({CHECK_MONTH})")
-    print(f"{'='*70}")
-    display(vf_daily)
-    print(f"\nMonthly: Entry {vf_daily['entry_qty_mwh'].sum():,.1f} MWh | "
-          f"Exit {vf_daily['exit_qty_mwh'].sum():,.1f} MWh | EUR {vf_daily['total_amount_eur'].sum():,.2f}")
-
-# COMMAND ----------
-
-# DBTITLE 1,Variable Fee — Equinor ZTPH Volumes
-# =============================================================================
-# VARIABLE FEE — EQUINOR ZTPH VOLUMES (dispatch + Endurast AST)
-# =============================================================================
-def get_ztph_shipper_daily(m_start, m_end, mapping_path):
-    full_map = pd.read_excel(mapping_path)
-    full_map['VALID_FROM'] = pd.to_datetime(full_map['VALID_FROM'])
-    full_map['VALID_TO']   = pd.to_datetime(full_map['VALID_TO'])
-    ztph_map = full_map[full_map['NODE_ID_DELIVERY'] == 'ZTPH'].copy()
-    print(f"Mapping: {len(ztph_map)} ZTPH stems, {ztph_map['SHIPPER_CODE'].nunique()} unique shippers")
-    df_raw = spark.table(DISPATCH_TABLE).filter(
-        (F.col('country') == COUNTRY) & (F.col('balancing_country') == COUNTRY) &
-        (F.col('location_id') == 'ZTPH') &
-        (~F.lower(F.col('contract_type')).contains('optimize')) &
-        (~F.lower(F.col('contract_type')).contains('balance')) &
-        (F.col('gas_day') >= str(m_start)) & (F.col('gas_day') <= str(m_end)) &
-        F.col('nomination').isNotNull())
-    agg_pd = df_raw.groupBy('gas_day', 'contract_id', 'contract_type', 'quantity_unit').agg(
-        F.sum('nomination').alias('volume_kwh')).toPandas()
-    agg_pd['gas_day'] = pd.to_datetime(agg_pd['gas_day']).dt.date
-    agg_pd['gas_day_ts'] = pd.to_datetime(agg_pd['gas_day'])
-    print(f"Dispatch: {len(agg_pd)} contract-day rows")
-    if len(agg_pd) == 0: return pd.DataFrame(), agg_pd
-    merged = agg_pd.merge(ztph_map[['CONTRACT_GROUP_ID','SHIPPER_CODE','VALID_FROM','VALID_TO']],
-        left_on='contract_id', right_on='CONTRACT_GROUP_ID', how='left')
-    has_mapping = merged['CONTRACT_GROUP_ID'].notna()
-    date_valid = ((merged['VALID_FROM'].isna()|(merged['VALID_FROM']<=merged['gas_day_ts'])) &
-                  (merged['VALID_TO'].isna()|(merged['VALID_TO']>=merged['gas_day_ts'])))
-    merged = merged[~has_mapping | date_valid].copy()
-    unmapped = merged[merged['SHIPPER_CODE'].isna()]['contract_id'].unique().tolist()
-    if unmapped: print(f"\u26a0\ufe0f Unmapped contracts: {unmapped}")
-    mapped = merged[merged['SHIPPER_CODE'].notna()].copy()
-    mapped['signed_kwh'] = mapped['volume_kwh']
-    disp_daily = mapped.groupby(['gas_day','SHIPPER_CODE']).agg(
-        signed_kwh=('signed_kwh','sum')).reset_index().rename(columns={'SHIPPER_CODE':'ShipperCode'})
-    # Endurast AST
-    w = Window.partitionBy('counterparty','shippercode','time').orderBy(F.col('enqueued_time').desc())
-    df_endu_raw = (spark.table("ms_atlas.endurast_raw.hourly_v1latest")
-        .filter((F.col('location')=='ZTPH Hub (H-Zone)')&
-                (F.to_date('time')>=str(m_start))&(F.to_date('time')<=str(m_end)))
-        .withColumn('rn', F.row_number().over(w)).filter(F.col('rn')==1))
-    endu_pre = (df_endu_raw.withColumn('gas_day',F.to_date('time'))
-        .select('gas_day','counterparty',F.col('shippercode').alias('ShipperCode'),'unit','quantity').toPandas())
-    endu_pre['gas_day'] = pd.to_datetime(endu_pre['gas_day']).dt.date
-    agg_endu = endu_pre.groupby(['gas_day','ShipperCode','unit'],as_index=False).agg(signed_kwh=('quantity','sum'))
-    print(f"Endurast AST: {len(agg_endu)} shipper-day rows")
-    combined = pd.concat([disp_daily[['gas_day','ShipperCode','signed_kwh']],
-                          agg_endu[['gas_day','ShipperCode','signed_kwh']]], ignore_index=True)
-    shipper_daily = combined.groupby(['gas_day','ShipperCode']).agg(net_kwh=('signed_kwh','sum')).reset_index()
-    shipper_daily['position'] = shipper_daily['net_kwh'].apply(
-        lambda x: 'NET BUY' if x>0 else ('NET SELL' if x<0 else 'FLAT'))
-    return shipper_daily, merged, agg_endu, endu_pre
-
-if len(vf_daily) > 0:
-    vf_shipper_daily, _, _, _ = get_ztph_shipper_daily(MONTH_START, MONTH_END, MAPPING_PATH)
-    if len(vf_shipper_daily) > 0:
-        print(f"\n{'='*75}")
-        print(f"ZTPH COMBINED NET POSITIONS \u2014 DAILY ({CHECK_MONTH})")
-        print(f"{'='*75}")
-        display(vf_shipper_daily.sort_values(['gas_day','ShipperCode']))
-    else:
-        print(f"\n\u26a0\ufe0f No ZTPH positions found for {CHECK_MONTH}.")
-else:
-    vf_shipper_daily = pd.DataFrame()
-    print("Variable Fee skipped (no invoice entries).")
-
-# COMMAND ----------
-
-# DBTITLE 1,Variable Fee — Compare & Save
-# =============================================================================
-# VARIABLE TRADING FEE — COMPARE & SAVE
-# =============================================================================
-if len(vf_daily) == 0 or len(vf_shipper_daily) == 0:
-    print("Variable Trading Fee comparison skipped (no data).")
-    vf_verdict = 'SKIPPED'; vf_num_flagged = 0
-else:
-    daily_exit = (vf_shipper_daily[vf_shipper_daily['net_kwh']<0]
-        .groupby('gas_day',as_index=False)['net_kwh'].sum()
-        .assign(eq_exit_kwh=lambda x: x['net_kwh'].abs()).drop(columns='net_kwh'))
-    up_eur_mwh = vf_daily['up_eur_mwh'].iloc[0]
-    vf_all_days = pd.DataFrame({'gas_day': pd.date_range(MONTH_START, MONTH_END).date})
-    vf_comp = (vf_all_days
-        .merge(vf_daily[['gas_day','entry_qty_mwh','exit_qty_mwh','entry_amount_eur','exit_amount_eur','total_amount_eur']], on='gas_day', how='left')
-        .merge(daily_exit, on='gas_day', how='left').fillna(0))
-    safe_div = lambda a,b: (a/b.replace(0,float('nan'))*100).round(2)
-    vf_comp['eq_exit_mwh'] = vf_comp['eq_exit_kwh']/1000.0
-    vf_comp['exit_diff_mwh'] = vf_comp['eq_exit_mwh'] - vf_comp['exit_qty_mwh']
-    vf_comp['exit_diff_pct'] = safe_div(vf_comp['exit_diff_mwh'], vf_comp['exit_qty_mwh'])
-    vf_comp['eq_exit_cost_eur'] = vf_comp['eq_exit_mwh']*up_eur_mwh
-    vf_comp['cost_diff_eur'] = vf_comp['eq_exit_cost_eur'] - vf_comp['exit_amount_eur']
-    vf_comp['flag'] = ''
-    vf_comp.loc[vf_comp['exit_diff_pct'].abs()>1.0, 'flag'] = '\u26a0\ufe0f EXIT'
-    vf_flagged = vf_comp[vf_comp['flag']!='']; vf_num_flagged = len(vf_flagged)
-    status = '\u2705 ALL MATCH' if vf_num_flagged==0 else f'\u26a0\ufe0f {vf_num_flagged} DAY(S) FLAGGED'
-    print(f"\n{'='*90}")
-    print(f"VARIABLE TRADING FEE \u2014 DAILY COMPARISON ({CHECK_MONTH})  [{status}]")
-    print(f"{'='*90}")
-    display(vf_comp[['gas_day','exit_qty_mwh','eq_exit_mwh','exit_diff_pct','exit_amount_eur','eq_exit_cost_eur','cost_diff_eur','flag']])
-    inv_exit_total = vf_comp['exit_qty_mwh'].sum()
-    eq_exit_total = vf_comp['eq_exit_mwh'].sum()
-    exit_vol_diff_pct = (eq_exit_total-inv_exit_total)/inv_exit_total*100 if inv_exit_total else 0
-    entry_exit_match = (abs(vf_comp['entry_qty_mwh']-vf_comp['exit_qty_mwh'])<0.01).all()
-    eq_grand_total = vf_comp['eq_exit_cost_eur'].sum()*2
-    inv_grand_total = vf_comp['total_amount_eur'].sum()
-    vf_verdict = 'VERIFIED' if abs(exit_vol_diff_pct)<1.0 else 'REVIEW REQUIRED'
-    print(f"\nVerdict: {'\u2705' if vf_verdict=='VERIFIED' else '\u26a0\ufe0f'} {vf_verdict}")
-    print(f"Exit vol diff: {exit_vol_diff_pct:+.4f}%  |  Double-charge: {'\u2705' if entry_exit_match else '\u26a0\ufe0f'}")
-    # Save
-    run_ts = datetime.now()
-    print(f"\nSaving Variable Fee results:")
-    vf_res = pd.DataFrame([{'check_month':CHECK_MONTH,'category':'ZTP Trading','line_type':'Variable Trading Fee',
-        'invoice_file':INVOICE_FILE,'invoice_qty':float(inv_exit_total),'equinor_qty':float(eq_exit_total),
-        'qty_diff_pct':float(exit_vol_diff_pct),'invoice_eur':float(inv_grand_total),
-        'equinor_eur':float(eq_grand_total),'eur_diff':float(eq_grand_total-inv_grand_total),
-        'days_flagged':vf_num_flagged,'price_match':True,'double_charge_confirmed':bool(entry_exit_match),
-        'verdict':vf_verdict,'run_timestamp':run_ts}])
-    _save_delta(vf_res, VF_RESULTS_TABLE, CHECK_MONTH)
-    if vf_num_flagged > 0:
-        vf_flags_df = pd.DataFrame([{'check_month':CHECK_MONTH,'gas_day':str(row['gas_day']),
-            'category':'ZTP Trading','line_type':'Variable Trading Fee',
-            'inv_qty':float(row['exit_qty_mwh']),'eq_qty':float(row['eq_exit_mwh']),
-            'qty_diff':float(row['exit_diff_mwh']),'qty_diff_pct':float(row['exit_diff_pct']),
-            'inv_up':float(up_eur_mwh),'eq_price':float(up_eur_mwh),'price_match':True,
-            'flag':row['flag'].strip(),'run_timestamp':run_ts} for _,row in vf_flagged.iterrows()])
-    else:
-        vf_flags_df = pd.DataFrame()
-    _save_delta(vf_flags_df, VF_FLAGS_TABLE, CHECK_MONTH)
-    print("Variable Fee save complete.")
-
-# COMMAND ----------
-
-# DBTITLE 1,Overall Summary
-# =============================================================================
-# OVERALL SUMMARY
-# =============================================================================
-print(f"{'='*80}")
-print(f"INVOICE CHECKER BELGIUM v2 \u2014 OVERALL SUMMARY")
-print(f"{'='*80}")
-print(f"Invoice: {INVOICE_FILE}  |  Invoice month: {invoice_month}\n")
-ltc_flag_count = len(ltc_flags)
-print(f"  {'\u2705' if ltc_flag_count==0 else '\u26a0\ufe0f'} Long Term Capacity: "
-      f"{'PASS' if ltc_flag_count==0 else f'{ltc_flag_count} issue(s) flagged'}")
-if not HAS_ALLOC:
-    print(f"  \u23ed\ufe0f Allocation Settlement: SKIPPED")
-else:
-    afc = len(alloc_flagged) if isinstance(alloc_flagged, pd.DataFrame) and len(alloc_flagged)>0 else 0
-    if not has_final: print(f"  \u23f3 Allocation Settlement ({SETTLE_MONTH_LABEL}): Awaiting final allocations")
-    elif afc==0: print(f"  \u2705 Allocation Settlement ({SETTLE_MONTH_LABEL}): PASS")
-    else: print(f"  \u26a0\ufe0f Allocation Settlement ({SETTLE_MONTH_LABEL}): {afc} day(s) flagged")
-if len(vf)==0: print(f"  \u23ed\ufe0f Variable Trading Fee: SKIPPED")
-elif vf_verdict=='SKIPPED': print(f"  \u23ed\ufe0f Variable Trading Fee: SKIPPED (no ZTPH data)")
-elif vf_verdict=='VERIFIED': print(f"  \u2705 Variable Trading Fee ({CHECK_MONTH}): PASS")
-else: print(f"  \u26a0\ufe0f Variable Trading Fee ({CHECK_MONTH}): {vf_verdict} \u2014 {vf_num_flagged} day(s) flagged")
-print(f"\n{'='*80}")
-print(f"All results saved to {NEW_SCHEMA}")
-print(f"{'='*80}")
-
-# COMMAND ----------
-
-# DBTITLE 1,Variable Fee — Parse Invoice
-# =============================================================================
-# VARIABLE TRADING FEE — PARSE INVOICE
-# =============================================================================
-
-if len(vf) == 0:
-    print(f"\u26a0\ufe0f No Variable Fee (ZTP Trading) entries in this invoice for {CHECK_MONTH}")
-    vf_daily = pd.DataFrame()
-    vf_monthly = pd.DataFrame()
-else:
-    # Pivot Entry and Exit into one row per day
-    entry = vf[vf['direction'] == 'Entry'].groupby('gas_day').agg(
-        entry_qty_mwh=('qty', 'sum'), up_eur_mwh=('up', 'first'),
-        entry_amount_eur=('amount', 'sum')
-    ).reset_index()
-    exit_ = vf[vf['direction'] == 'Exit'].groupby('gas_day').agg(
-        exit_qty_mwh=('qty', 'sum'), exit_amount_eur=('amount', 'sum')
-    ).reset_index()
-
-    vf_daily = entry.merge(exit_, on='gas_day', how='outer').sort_values('gas_day').reset_index(drop=True)
-    vf_daily['total_amount_eur'] = vf_daily['entry_amount_eur'] + vf_daily['exit_amount_eur']
-
-    print(f"\n{'='*70}")
-    print(f"VARIABLE FEE (ZTP Trading) \u2014 DAILY ({CHECK_MONTH})")
-    print(f"{'='*70}")
-    display(vf_daily)
-
-    vf_monthly = pd.DataFrame([{
-        'billing_month': CHECK_MONTH,
-        'rate_eur_mwh': vf_daily['up_eur_mwh'].iloc[0],
-        'entry_qty_mwh': vf_daily['entry_qty_mwh'].sum(),
-        'exit_qty_mwh': vf_daily['exit_qty_mwh'].sum(),
-        'entry_amount_eur': vf_daily['entry_amount_eur'].sum(),
-        'exit_amount_eur': vf_daily['exit_amount_eur'].sum(),
-        'total_amount_eur': vf_daily['total_amount_eur'].sum(),
-    }])
-    print(f"\nMONTHLY SUMMARY:")
-    display(vf_monthly)
-
-# COMMAND ----------
-
-# DBTITLE 1,Variable Fee — Equinor ZTPH Volumes
-# =============================================================================
-# VARIABLE FEE — EQUINOR ZTPH VOLUMES (dispatch + Endurast AST)
-# =============================================================================
-
-def get_ztph_shipper_daily(month_start, month_end, mapping_path):
-    """Pull ZTPH volumes using NAIVE DATE strategy (no timezone conversion)."""
-    full_map = pd.read_excel(mapping_path)
-    full_map['VALID_FROM'] = pd.to_datetime(full_map['VALID_FROM'])
-    full_map['VALID_TO']   = pd.to_datetime(full_map['VALID_TO'])
-    ztph_map = full_map[full_map['NODE_ID_DELIVERY'] == 'ZTPH'].copy()
-    print(f"Mapping: {len(ztph_map)} ZTPH stems, {ztph_map['SHIPPER_CODE'].nunique()} unique shippers")
-
-    # --- Pull ZTPH dispatch ---
-    df_raw = spark.table(DISPATCH_TABLE).filter(
-        (F.col('country') == COUNTRY) & (F.col('balancing_country') == COUNTRY) &
-        (F.col('location_id') == 'ZTPH') &
-        (~F.lower(F.col('contract_type')).contains('optimize')) &
-        (~F.lower(F.col('contract_type')).contains('balance')) &
-        (F.col('gas_day') >= str(month_start)) & (F.col('gas_day') <= str(month_end)) &
-        F.col('nomination').isNotNull()
-    )
-    agg_pd = (
-        df_raw.groupBy('gas_day', 'contract_id', 'contract_type', 'quantity_unit')
-        .agg(F.sum('nomination').alias('volume_kwh')).toPandas()
-    )
-    agg_pd['gas_day']    = pd.to_datetime(agg_pd['gas_day']).dt.date
-    agg_pd['gas_day_ts'] = pd.to_datetime(agg_pd['gas_day'])
-    print(f"Dispatch: {len(agg_pd)} contract-day rows, {agg_pd['contract_id'].nunique()} unique contracts")
-
-    if len(agg_pd) == 0:
-        return pd.DataFrame(), agg_pd
-
-    # --- Stem + date-validity join ---
-    merged = agg_pd.merge(
-        ztph_map[['CONTRACT_GROUP_ID', 'SHIPPER_CODE', 'VALID_FROM', 'VALID_TO']],
-        left_on='contract_id', right_on='CONTRACT_GROUP_ID', how='left'
-    )
-    has_mapping = merged['CONTRACT_GROUP_ID'].notna()
-    date_valid = (
-        (merged['VALID_FROM'].isna() | (merged['VALID_FROM'] <= merged['gas_day_ts'])) &
-        (merged['VALID_TO'].isna()   | (merged['VALID_TO']   >= merged['gas_day_ts']))
-    )
-    merged = merged[~has_mapping | date_valid].copy()
-    unmapped = merged[merged['SHIPPER_CODE'].isna()]['contract_id'].unique().tolist()
-    if unmapped:
-        print(f"\u26a0\ufe0f Unmapped contracts: {unmapped}")
-
-    mapped = merged[merged['SHIPPER_CODE'].notna()].copy()
-    mapped['signed_kwh'] = mapped['volume_kwh']
-    disp_daily = (
-        mapped.groupby(['gas_day', 'SHIPPER_CODE']).agg(signed_kwh=('signed_kwh', 'sum'))
-        .reset_index().rename(columns={'SHIPPER_CODE': 'ShipperCode'})
-    )
-
-    # --- Endurast AST ---
-    ENDURAST_HOURLY_TABLE = "ms_atlas.endurast_raw.hourly_v1latest"
-    w_hourly_endu = Window.partitionBy('counterparty', 'shippercode', 'time').orderBy(F.col('enqueued_time').desc())
-    df_endu_raw = (
-        spark.table(ENDURAST_HOURLY_TABLE)
-        .filter((F.col('location') == 'ZTPH Hub (H-Zone)') &
-                (F.to_date('time') >= str(month_start)) & (F.to_date('time') <= str(month_end)))
-        .withColumn('rn', F.row_number().over(w_hourly_endu)).filter(F.col('rn') == 1)
-    )
-    endu_pre_agg = (
-        df_endu_raw.withColumn('gas_day', F.to_date('time'))
-        .select('gas_day', 'counterparty', F.col('shippercode').alias('ShipperCode'), 'unit', 'quantity').toPandas()
-    )
-    endu_pre_agg['gas_day'] = pd.to_datetime(endu_pre_agg['gas_day']).dt.date
-    agg_endu = endu_pre_agg.groupby(['gas_day', 'ShipperCode', 'unit'], as_index=False).agg(signed_kwh=('quantity', 'sum'))
-    print(f"Endurast AST: {len(agg_endu)} shipper-day rows, {agg_endu['ShipperCode'].nunique()} unique shippers")
-
-    # --- Combine both sources ---
-    combined = pd.concat([
-        disp_daily[['gas_day', 'ShipperCode', 'signed_kwh']],
-        agg_endu[['gas_day',  'ShipperCode', 'signed_kwh']],
-    ], ignore_index=True)
-    shipper_daily = combined.groupby(['gas_day', 'ShipperCode']).agg(net_kwh=('signed_kwh', 'sum')).reset_index()
-    shipper_daily['position'] = shipper_daily['net_kwh'].apply(
-        lambda x: 'NET BUY' if x > 0 else ('NET SELL' if x < 0 else 'FLAT'))
-    return shipper_daily, merged, agg_endu, endu_pre_agg
-
-if len(vf_daily) > 0:
-    vf_shipper_daily, vf_contract_detail, vf_endurast_detail, vf_endurast_txn = get_ztph_shipper_daily(
-        MONTH_START, MONTH_END, MAPPING_PATH)
-    if len(vf_shipper_daily) > 0:
-        print(f"\n{'='*75}")
-        print(f"ZTPH COMBINED NET POSITIONS \u2014 DAILY ({CHECK_MONTH})")
-        print(f"{'='*75}")
-        display(vf_shipper_daily.sort_values(['gas_day', 'ShipperCode']))
-    else:
-        print(f"\n\u26a0\ufe0f No ZTPH positions found for {CHECK_MONTH}.")
-else:
-    vf_shipper_daily = pd.DataFrame()
-    print("Variable Fee skipped (no invoice entries).")
-
-# COMMAND ----------
-
-# DBTITLE 1,Variable Fee — Compare & Save
-# =============================================================================
-# VARIABLE TRADING FEE — COMPARE & SAVE
-# =============================================================================
-if len(vf_daily) == 0 or len(vf_shipper_daily) == 0:
-    print("Variable Trading Fee comparison skipped (no data).")
-    vf_verdict = 'SKIPPED'; vf_num_flagged = 0
-else:
-    daily_exit = (vf_shipper_daily[vf_shipper_daily['net_kwh']<0]
-        .groupby('gas_day',as_index=False)['net_kwh'].sum()
-        .assign(eq_exit_kwh=lambda x: x['net_kwh'].abs()).drop(columns='net_kwh'))
-    up_eur_mwh = vf_daily['up_eur_mwh'].iloc[0]
-    vf_all_days = pd.DataFrame({'gas_day': pd.date_range(MONTH_START, MONTH_END).date})
-    vf_comp = (vf_all_days
-        .merge(vf_daily[['gas_day','entry_qty_mwh','exit_qty_mwh','entry_amount_eur','exit_amount_eur','total_amount_eur']], on='gas_day', how='left')
-        .merge(daily_exit, on='gas_day', how='left').fillna(0))
-    safe_div = lambda a,b: (a/b.replace(0,float('nan'))*100).round(2)
-    vf_comp['eq_exit_mwh'] = vf_comp['eq_exit_kwh']/1000.0
-    vf_comp['exit_diff_mwh'] = vf_comp['eq_exit_mwh'] - vf_comp['exit_qty_mwh']
-    vf_comp['exit_diff_pct'] = safe_div(vf_comp['exit_diff_mwh'], vf_comp['exit_qty_mwh'])
-    vf_comp['eq_exit_cost_eur'] = vf_comp['eq_exit_mwh']*up_eur_mwh
-    vf_comp['cost_diff_eur'] = vf_comp['eq_exit_cost_eur'] - vf_comp['exit_amount_eur']
-    vf_comp['flag'] = ''
-    vf_comp.loc[vf_comp['exit_diff_pct'].abs()>1.0, 'flag'] = '\u26a0\ufe0f EXIT'
-    vf_flagged = vf_comp[vf_comp['flag']!='']; vf_num_flagged = len(vf_flagged)
-    status = '\u2705 ALL MATCH' if vf_num_flagged==0 else f'\u26a0\ufe0f {vf_num_flagged} DAY(S) FLAGGED'
-    print(f"\n{'='*90}")
-    print(f"VARIABLE TRADING FEE \u2014 DAILY COMPARISON ({CHECK_MONTH})  [{status}]")
-    print(f"{'='*90}")
-    display(vf_comp[['gas_day','exit_qty_mwh','eq_exit_mwh','exit_diff_pct','exit_amount_eur','eq_exit_cost_eur','cost_diff_eur','flag']])
-    inv_exit_total = vf_comp['exit_qty_mwh'].sum()
-    eq_exit_total = vf_comp['eq_exit_mwh'].sum()
-    exit_vol_diff_pct = (eq_exit_total-inv_exit_total)/inv_exit_total*100 if inv_exit_total else 0
-    entry_exit_match = (abs(vf_comp['entry_qty_mwh']-vf_comp['exit_qty_mwh'])<0.01).all()
-    eq_grand_total = vf_comp['eq_exit_cost_eur'].sum()*2
-    inv_grand_total = vf_comp['total_amount_eur'].sum()
-    vf_verdict = 'VERIFIED' if abs(exit_vol_diff_pct)<1.0 else 'REVIEW REQUIRED'
-    print(f"\nVerdict: {'\u2705' if vf_verdict=='VERIFIED' else '\u26a0\ufe0f'} {vf_verdict}")
-    print(f"Exit vol diff: {exit_vol_diff_pct:+.4f}%  |  Double-charge: {'\u2705' if entry_exit_match else '\u26a0\ufe0f'}")
-    run_ts = datetime.now()
-    print(f"\nSaving Variable Fee results:")
-    vf_res = pd.DataFrame([{'check_month':CHECK_MONTH,'category':'ZTP Trading','line_type':'Variable Trading Fee',
-        'invoice_file':INVOICE_FILE,'invoice_qty':float(inv_exit_total),'equinor_qty':float(eq_exit_total),
-        'qty_diff_pct':float(exit_vol_diff_pct),'invoice_eur':float(inv_grand_total),
-        'equinor_eur':float(eq_grand_total),'eur_diff':float(eq_grand_total-inv_grand_total),
-        'days_flagged':vf_num_flagged,'price_match':True,'double_charge_confirmed':bool(entry_exit_match),
-        'verdict':vf_verdict,'run_timestamp':run_ts}])
-    _save_delta(vf_res, VF_RESULTS_TABLE, CHECK_MONTH)
-    if vf_num_flagged > 0:
-        vf_flags_df = pd.DataFrame([{'check_month':CHECK_MONTH,'gas_day':str(row['gas_day']),
-            'category':'ZTP Trading','line_type':'Variable Trading Fee',
-            'inv_qty':float(row['exit_qty_mwh']),'eq_qty':float(row['eq_exit_mwh']),
-            'qty_diff':float(row['exit_diff_mwh']),'qty_diff_pct':float(row['exit_diff_pct']),
-            'inv_up':float(up_eur_mwh),'eq_price':float(up_eur_mwh),'price_match':True,
-            'flag':row['flag'].strip(),'run_timestamp':run_ts} for _,row in vf_flagged.iterrows()])
-    else:
-        vf_flags_df = pd.DataFrame()
-    _save_delta(vf_flags_df, VF_FLAGS_TABLE, CHECK_MONTH)
-    print("Variable Fee save complete.")
-
-# COMMAND ----------
-
-# DBTITLE 1,Variable Fee — Compare & Save
-# =============================================================================
-# VARIABLE TRADING FEE — COMPARE & SAVE
-# =============================================================================
-
-if len(vf_daily) == 0 or len(vf_shipper_daily) == 0:
-    print("Variable Trading Fee comparison skipped (no data).")
-    vf_verdict = 'SKIPPED'
-    vf_num_flagged = 0
-else:
-    # Aggregate netted SELL volumes per day
-    daily_exit = (
-        vf_shipper_daily[vf_shipper_daily['net_kwh'] < 0]
-        .groupby('gas_day', as_index=False)['net_kwh'].sum()
-        .assign(eq_exit_kwh=lambda x: x['net_kwh'].abs())
-        .drop(columns='net_kwh')
-    )
-    up_eur_mwh = vf_daily['up_eur_mwh'].iloc[0]
-
-    vf_all_days = pd.DataFrame({'gas_day': pd.date_range(MONTH_START, MONTH_END).date})
-    vf_comp = (
-        vf_all_days
-        .merge(vf_daily[['gas_day', 'entry_qty_mwh', 'exit_qty_mwh',
-                          'entry_amount_eur', 'exit_amount_eur', 'total_amount_eur']],
-               on='gas_day', how='left')
-        .merge(daily_exit, on='gas_day', how='left')
-        .fillna(0)
-    )
-    safe_div = lambda a, b: (a / b.replace(0, float('nan')) * 100).round(2)
-
-    vf_comp['eq_exit_mwh']      = vf_comp['eq_exit_kwh'] / 1000.0
-    vf_comp['exit_diff_mwh']    = vf_comp['eq_exit_mwh'] - vf_comp['exit_qty_mwh']
-    vf_comp['exit_diff_pct']    = safe_div(vf_comp['exit_diff_mwh'], vf_comp['exit_qty_mwh'])
-    vf_comp['eq_exit_cost_eur'] = vf_comp['eq_exit_mwh'] * up_eur_mwh
-    vf_comp['cost_diff_eur']    = vf_comp['eq_exit_cost_eur'] - vf_comp['exit_amount_eur']
-    vf_comp['flag'] = ''
-    mask_exit = vf_comp['exit_diff_pct'].abs() > 1.0
-    vf_comp.loc[mask_exit, 'flag'] = '\u26a0\ufe0f EXIT'
-
-    vf_flagged = vf_comp[vf_comp['flag'] != '']
-    vf_num_flagged = len(vf_flagged)
-    status = '\u2705 ALL MATCH' if vf_num_flagged == 0 else f'\u26a0\ufe0f {vf_num_flagged} DAY(S) FLAGGED'
-
-    print(f"\n{'='*90}")
-    print(f"VARIABLE TRADING FEE \u2014 DAILY COMPARISON ({CHECK_MONTH})  [{status}]")
-    print(f"UP: {up_eur_mwh} EUR/MWh (from invoice)")
-    print(f"{'='*90}")
-    display(vf_comp[['gas_day', 'exit_qty_mwh', 'eq_exit_mwh', 'exit_diff_pct',
-                     'exit_amount_eur', 'eq_exit_cost_eur', 'cost_diff_eur', 'flag']])
-
-    # Monthly summary
-    inv_exit_total    = vf_comp['exit_qty_mwh'].sum()
-    eq_exit_total     = vf_comp['eq_exit_mwh'].sum()
-    exit_vol_diff_pct = (eq_exit_total - inv_exit_total) / inv_exit_total * 100 if inv_exit_total else 0
-    inv_exit_eur      = vf_comp['exit_amount_eur'].sum()
-    eq_exit_eur       = vf_comp['eq_exit_cost_eur'].sum()
-    exit_cost_diff    = eq_exit_eur - inv_exit_eur
-    vf_verdict        = 'VERIFIED' if abs(exit_vol_diff_pct) < 1.0 else 'REVIEW REQUIRED'
-
-    # Double-charge verification
-    entry_exit_match = (abs(vf_comp['entry_qty_mwh'] - vf_comp['exit_qty_mwh']) < 0.01).all()
-    eq_grand_total   = eq_exit_eur * 2
-    inv_grand_total  = vf_comp['total_amount_eur'].sum()
-    grand_total_diff = eq_grand_total - inv_grand_total
-
-    print(f"\n{'='*90}")
-    print(f"MONTHLY SUMMARY \u2014 Variable Trading Fee ({CHECK_MONTH})")
-    print(f"{'='*90}")
-    print(f"  Verdict: {'\u2705' if vf_verdict == 'VERIFIED' else '\u26a0\ufe0f'} {vf_verdict}")
-    print(f"  Exit vol diff: {exit_vol_diff_pct:+.4f}%  |  Cost diff: EUR {exit_cost_diff:+,.2f}")
-    print(f"  Double-charge: {'\u2705 CONFIRMED' if entry_exit_match else '\u26a0\ufe0f NOT UNIFORM'}")
-    print(f"  Est. total (\u00d72): EUR {eq_grand_total:,.2f}  |  Invoice: EUR {inv_grand_total:,.2f}  |  Diff: EUR {grand_total_diff:+,.2f}")
-
-    # --- SAVE ---
-    run_ts = datetime.now()
-    print(f"\nSaving Variable Fee results:")
-
-    # Results
-    vf_res = pd.DataFrame([{
-        'check_month': CHECK_MONTH, 'category': 'ZTP Trading', 'line_type': 'Variable Trading Fee',
-        'invoice_file': INVOICE_FILE, 'invoice_qty': float(inv_exit_total),
-        'equinor_qty': float(eq_exit_total), 'qty_diff_pct': float(exit_vol_diff_pct),
-        'invoice_eur': float(inv_grand_total), 'equinor_eur': float(eq_grand_total),
-        'eur_diff': float(grand_total_diff), 'days_flagged': vf_num_flagged,
-        'price_match': True, 'double_charge_confirmed': bool(entry_exit_match),
-        'verdict': vf_verdict, 'run_timestamp': run_ts,
-    }])
-    _save_delta(vf_res, VF_RESULTS_TABLE, CHECK_MONTH)
-
-    # Flags
-    if vf_num_flagged > 0:
-        flag_rows = []
-        for _, row in vf_flagged.iterrows():
-            flag_rows.append({
-                'check_month': CHECK_MONTH, 'gas_day': str(row['gas_day']),
-                'category': 'ZTP Trading', 'line_type': 'Variable Trading Fee',
-                'inv_qty': float(row['exit_qty_mwh']), 'eq_qty': float(row['eq_exit_mwh']),
-                'qty_diff': float(row['exit_diff_mwh']), 'qty_diff_pct': float(row['exit_diff_pct']),
-                'inv_up': float(up_eur_mwh), 'eq_price': float(up_eur_mwh),
-                'price_match': True, 'flag': row['flag'].strip(), 'run_timestamp': run_ts,
-            })
-        vf_flags_df = pd.DataFrame(flag_rows)
-    else:
-        vf_flags_df = pd.DataFrame()
-    _save_delta(vf_flags_df, VF_FLAGS_TABLE, CHECK_MONTH)
-    print(f"Variable Fee save complete.")
-
-# COMMAND ----------
-
-# DBTITLE 1,Overall Summary
-# =============================================================================
-# OVERALL SUMMARY
-# =============================================================================
-
-print(f"{'='*80}")
-print(f"INVOICE CHECKER BELGIUM v2 \u2014 OVERALL SUMMARY")
-print(f"{'='*80}")
-print(f"Invoice: {INVOICE_FILE}")
-print(f"Invoice month: {invoice_month}")
-print()
-
-# --- LTC ---
-ltc_flag_count = len(ltc_flags)
-if ltc_flag_count == 0:
-    print(f"  \u2705 Long Term Capacity: PASS \u2014 all routes match")
-else:
-    print(f"  \u26a0\ufe0f Long Term Capacity: {ltc_flag_count} issue(s) flagged")
-
-# --- Allocation Settlement ---
-if not HAS_ALLOC:
-    print(f"  \u23ed\ufe0f Allocation Settlement: SKIPPED (not in this invoice)")
-else:
-    alloc_flag_count = len(alloc_flagged) if 'alloc_flagged' in dir() and len(alloc_flagged) > 0 else 0
-    if not has_final:
-        print(f"  \u23f3 Allocation Settlement ({SETTLE_MONTH_LABEL}): Awaiting final allocations")
-    elif alloc_flag_count == 0:
-        print(f"  \u2705 Allocation Settlement ({SETTLE_MONTH_LABEL}): PASS")
-    else:
-        print(f"  \u26a0\ufe0f Allocation Settlement ({SETTLE_MONTH_LABEL}): {alloc_flag_count} day(s) flagged")
-
-# --- Variable Fee ---
 if len(vf) == 0:
     print(f"  \u23ed\ufe0f Variable Trading Fee: SKIPPED (not in this invoice)")
 elif vf_verdict == 'SKIPPED':
